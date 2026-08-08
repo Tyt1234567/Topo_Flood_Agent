@@ -11,51 +11,12 @@
 
 <header>
   <h1>GeoAI Agent</h1>
-  <nav>
-    <button class="tab-btn active" data-tab="town">Town Scenario</button>
-    <button class="tab-btn" data-tab="realworld">Real-World Data</button>
-  </nav>
+  <p class="header-subtitle">Real-world terrain &amp; weather analysis</p>
 </header>
 
 <main>
 
-  <section id="tab-town" class="tab-panel active">
-    <div class="sidebar">
-      <h2>Ask a spatial question</h2>
-      <p class="hint">Routes to geometry tools, network topology, or discrete-Morse
-        scalar-field analysis over the synthetic town, depending on the question.</p>
-      <textarea id="town-query" rows="3" placeholder="e.g. Where would floodwater actually pool in this town, and how significant are those low points compared to noise?"></textarea>
-      <button id="town-submit" class="primary">Ask</button>
-
-      <div id="town-examples" class="examples">
-        <span class="hint">Examples</span>
-        <ul>
-          <li data-example="Which bridge should we reinforce first, considering flood risk and the population that depends on it to reach the hospital?">Which bridge should we reinforce first?</li>
-          <li data-example="What is the area of zone_cluster_a?">What is the area of zone_cluster_a?</li>
-          <li data-example="Where would floodwater actually pool in this town, and how significant are those low points compared to noise?">Where would floodwater pool?</li>
-          <li data-example="Where are the population density peaks, and what's the natural boundary between the two residential clusters?">Where are the population density peaks?</li>
-        </ul>
-      </div>
-
-      <div id="town-status" class="status"></div>
-
-      <div id="town-result" class="card" hidden>
-        <h3 id="town-route-label"></h3>
-        <pre id="town-recommendation"></pre>
-        <div id="town-feedback-box">
-          <label for="town-feedback">Not satisfied? Say what's wrong -- re-runs with this folded in</label>
-          <textarea id="town-feedback" rows="2" placeholder="e.g. ignore flood risk, focus on accessibility only"></textarea>
-          <div class="button-row">
-            <button id="town-rerun" class="primary">Re-run with feedback</button>
-            <button id="town-accept" class="secondary">Accept</button>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div id="town-map" class="map"></div>
-  </section>
-
-  <section id="tab-realworld" class="tab-panel">
+  <section id="app-panel">
     <div class="sidebar">
       <h2>Describe what to analyze</h2>
       <p class="hint">Name a real place or a lat/lon box, and optionally a topic (terrain,
