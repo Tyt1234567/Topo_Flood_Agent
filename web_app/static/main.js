@@ -1,21 +1,5 @@
 "use strict";
 
-// -- tabs -----------------------------------------------------------------
-
-document.querySelectorAll(".tab-btn").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-    document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
-    btn.classList.add("active");
-    document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
-    // Leaflet needs a nudge after its container becomes visible.
-    setTimeout(() => {
-      if (townMap) townMap.invalidateSize();
-      if (realworldMap) realworldMap.invalidateSize();
-    }, 50);
-  });
-});
-
 function setStatus(id, message, isError) {
   const el = document.getElementById(id);
   el.textContent = message || "";
@@ -71,150 +55,6 @@ function pointsLayer(geojson, labelPrefix) {
     },
   });
 }
-
-// -- Town Scenario ----------------------------------------------------------
-
-let townMap;
-let townLayerControl;
-const townOverlays = {};
-let townDynamicLayerNames = []; // layers added per-query (e.g. morse field/points) -- cleared each run
-
-function addTownOverlay(name, layer, defaultOn) {
-  if (townOverlays[name]) {
-    townMap.removeLayer(townOverlays[name]);
-  }
-  townOverlays[name] = layer;
-  if (defaultOn) layer.addTo(townMap);
-  if (townLayerControl) townMap.removeControl(townLayerControl);
-  townLayerControl = L.control.layers(null, townOverlays, { collapsed: false }).addTo(townMap);
-}
-
-// Removes only the layers added by the previous query (roads/zones/hazard/
-// population are untouched) -- without this, switching topics (e.g. an
-// elevation question followed by a hazard_intensity question) left the old
-// field's heatmap and critical-point markers stuck on the map forever.
-function clearTownDynamicOverlays() {
-  townDynamicLayerNames.forEach((name) => {
-    if (townOverlays[name]) {
-      townMap.removeLayer(townOverlays[name]);
-      delete townOverlays[name];
-    }
-  });
-  townDynamicLayerNames = [];
-  if (townLayerControl) townMap.removeControl(townLayerControl);
-  townLayerControl = L.control.layers(null, townOverlays, { collapsed: false }).addTo(townMap);
-}
-
-async function initTownMap() {
-  townMap = L.map("town-map", { crs: L.CRS.Simple });
-
-  const res = await fetch("/api/town/base_map");
-  const data = await res.json();
-  townMap.fitBounds(data.bounds);
-
-  const roads = L.geoJSON(data.roads, {
-    style: (f) => f.properties.is_bridge_structure
-      ? { color: "#c0392b", weight: 5 }
-      : { color: "#888", weight: 2 },
-  });
-  const zones = L.geoJSON(data.zones, {
-    style: () => ({ color: "#2b6cb0", weight: 1, fillOpacity: 0.1 }),
-    onEachFeature: (f, layer) => layer.bindTooltip(f.properties.name),
-  });
-  const hazard = L.geoJSON(data.hazard_zone, {
-    style: () => ({ color: "#c0392b", weight: 1, fillOpacity: 0.15, dashArray: "4" }),
-  });
-  const population = L.geoJSON(data.population, {
-    pointToLayer: (f, latlng) =>
-      L.circleMarker(latlng, {
-        radius: 4 + Math.sqrt(f.properties.population) / 8,
-        color: "#27632a", fillColor: "#4caf50", weight: 1, fillOpacity: 0.7,
-      }),
-    onEachFeature: (f, layer) => layer.bindPopup(`population: ${f.properties.population}`),
-  });
-
-  addTownOverlay("roads", roads, true);
-  addTownOverlay("zones", zones, true);
-  addTownOverlay("hazard zone", hazard, true);
-  addTownOverlay("population", population, true);
-}
-
-function renderTownResult(result) {
-  const box = document.getElementById("town-result");
-  box.hidden = false;
-  const label = document.getElementById("town-route-label");
-  const rec = document.getElementById("town-recommendation");
-  const feedbackBox = document.getElementById("town-feedback-box");
-
-  clearTownDynamicOverlays(); // start every new query from a clean map, regardless of route
-
-  if (result.route === "geometry") {
-    label.textContent = "Geometry tool result";
-    rec.textContent = JSON.stringify(result.tool_result, null, 2);
-    feedbackBox.style.display = "none"; // matches CLI: geometry route has no human review step
-  } else {
-    label.textContent = result.route === "morse" ? "Morse topology recommendation" : "Topology recommendation";
-    rec.textContent = result.recommendation || "(no recommendation returned)";
-    feedbackBox.style.display = "";
-  }
-
-  if (result.route === "morse" && result.geojson) {
-    const field = fieldLayer(result.geojson.field);
-    const points = pointsLayer(result.geojson.points, result.field);
-    const fieldName = result.field + " (field)";
-    const pointsName = result.field + " (critical points)";
-    addTownOverlay(fieldName, field, true);
-    addTownOverlay(pointsName, points, true);
-    townDynamicLayerNames.push(fieldName, pointsName);
-  }
-}
-
-let currentTownQuery = "";
-
-async function submitTownQuery(feedback) {
-  const queryBox = document.getElementById("town-query");
-  const query = feedback ? currentTownQuery : queryBox.value.trim();
-  if (!query) {
-    setStatus("town-status", "Enter a question first.", true);
-    return;
-  }
-  currentTownQuery = query;
-
-  setStatus("town-status", "Running pipeline (this can take a little while on a local model)...");
-  document.getElementById("town-result").hidden = true;
-  try {
-    const res = await fetch("/api/town/query", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ original_query: query, feedback: feedback || "" }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "request failed");
-    renderTownResult(data);
-    setStatus("town-status", "");
-  } catch (err) {
-    setStatus("town-status", "Error: " + err.message, true);
-  }
-}
-
-document.getElementById("town-submit").addEventListener("click", () => submitTownQuery(null));
-document.getElementById("town-rerun").addEventListener("click", () => {
-  const feedback = document.getElementById("town-feedback").value.trim();
-  if (!feedback) {
-    setStatus("town-status", "Type feedback first, or click Accept.", true);
-    return;
-  }
-  submitTownQuery(feedback);
-});
-document.getElementById("town-accept").addEventListener("click", () => {
-  document.getElementById("town-feedback-box").style.display = "none";
-  setStatus("town-status", "Recommendation accepted.");
-});
-document.querySelectorAll("#town-examples li").forEach((li) => {
-  li.addEventListener("click", () => {
-    document.getElementById("town-query").value = li.dataset.example;
-  });
-});
 
 // -- Real-World Data ---------------------------------------------------------
 
@@ -579,6 +419,5 @@ document.getElementById("sq-modal-edit").addEventListener("click", () => {
 
 // -- init ---------------------------------------------------------------
 
-initTownMap();
 initRealworldMap();
 updateGroundResolutionHint();

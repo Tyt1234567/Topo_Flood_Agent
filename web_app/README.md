@@ -1,11 +1,12 @@
 # GeoAI Agent -- Web UI
 
-A Flask + vanilla JS/Leaflet front end over the GeoAI agent's analysis
-engine. This folder is self-contained: `geoai_agent/` below is a standalone
-copy of the routing/discrete-Morse-theory/real-world-data/GeoJSON package
-(not an import of anything outside `web_app/`), and `examples/` holds its
-own sample CSV layer. Nothing in this folder reaches outside it -- you can
-copy just `web_app/` elsewhere and it still runs.
+A Flask + vanilla JS/Leaflet front end over the GeoAI agent's real-world
+data and discrete-Morse-theory analysis engine. This folder is
+self-contained: `geoai_agent/` below is a standalone copy of the
+discrete-Morse-theory/real-world-data/GeoJSON package (not an import of
+anything outside `web_app/`), and `examples/` holds its own sample CSV
+layer. Nothing in this folder reaches outside it -- you can copy just
+`web_app/` elsewhere and it still runs.
 
 ## Run
 
@@ -21,17 +22,7 @@ project (`qwen2.5:7b-instruct` pulled and running on
 `http://localhost:11434`) for the LLM-driven routing and recommendation
 steps. Open http://localhost:5000 once it's running.
 
-## What's in each panel
-
-**Town Scenario** -- type a free-text spatial question about the synthetic
-town (same one `main.py` uses). It's routed through the full pipeline
-(`geoai_agent/agent.py`): geometry tools, network topology, or discrete
-Morse analysis over a scalar field, whichever the question needs. The map
-always shows the town's road network, zones, hazard zone, and population;
-a Morse-routed question additionally overlays that field's heatmap and
-critical points, toggleable via the layer control. After a recommendation
-comes back you can type feedback and re-run (same human-in-the-loop
-re-run the CLI supports), or accept it.
+## What's in the panel
 
 **Real-World Data** -- one bounding box, one topic (elevation, temperature,
 precipitation, wind, humidity, or pressure -- live-fetched from Open-Meteo,
@@ -50,22 +41,20 @@ basemap with one heatmap + critical-points overlay per layer.
 
 ## API endpoints
 
-- `GET /api/town/base_map` -- static GeoJSON for the town's roads, zones,
-  hazard zone, and population points.
-- `POST /api/town/query` -- `{"original_query": "...", "feedback": "..."}`
-  (feedback optional) -> runs `GeoAIAgent.run_once`, returns the route,
-  recommendation, and (for the morse route) field GeoJSON.
 - `POST /api/realworld/smart_query` -- `{"query": "..."}` -> an LLM
   extraction call works out `{bounds, variable, resolved_place}` from free
   text; returns what was understood without fetching anything. The
   frontend fills the manual fields in from this response.
-- `POST /api/realworld/analyze` -- multipart form: `bounds`, `resolution`,
-  `primary_variable`, `use_sample_layer`, `recommend`, plus any number of
-  `layer_name` + `layer_file::<name>` (+ optional `layer_description::<name>`)
-  pairs for custom CSV/shapefile layers -> runs `build_real_world_dataset`
-  + `analyze_scalar_field` per layer, returns GeoJSON + summaries (+ an
-  LLM recommendation for `primary_variable` if requested). The single
-  fetch+analyze action for this panel.
+- `POST /api/realworld/load_data` -- multipart form: `bounds`, `resolution_meters`,
+  `primary_variable`, `use_sample_layer`, plus any custom `layer_name` +
+  `layer_file::<name>` pairs -> fetches just the raw scalar field(s) and
+  caches them server-side under a `dataset_id`, so the map can show the
+  real heatmap immediately after a place is confirmed.
+- `POST /api/realworld/analyze` -- same form fields, plus `recommend` and
+  optionally a cached `dataset_id` -> runs `build_real_world_dataset` (if
+  not reusing a cached dataset) + `analyze_scalar_field` per layer, returns
+  GeoJSON + summaries (+ an LLM recommendation for `primary_variable` if
+  requested). The final fetch+analyze action for the panel.
 
 ## Notes
 

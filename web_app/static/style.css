@@ -20,8 +20,8 @@ html, body {
 
 header {
   display: flex;
-  align-items: center;
-  gap: 24px;
+  align-items: baseline;
+  gap: 12px;
   padding: 12px 20px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-card);
@@ -33,40 +33,20 @@ header h1 {
   margin: 0;
 }
 
-nav { display: flex; gap: 6px; }
-
-.tab-btn {
-  padding: 6px 14px;
-  border: 1px solid var(--border);
-  background: white;
-  border-radius: 999px;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 500;
+.header-subtitle {
+  font-size: 12.5px;
   color: var(--text-muted);
-  transition: background .12s, color .12s, border-color .12s;
-}
-
-.tab-btn:hover { border-color: var(--accent); color: var(--accent); }
-
-.tab-btn.active {
-  background: var(--accent);
-  color: white;
-  border-color: var(--accent);
+  margin: 0;
 }
 
 main {
   height: calc(100% - 55px);
 }
 
-.tab-panel {
-  display: none;
+#app-panel {
+  display: grid;
   height: 100%;
   grid-template-columns: 320px 1fr;
-}
-
-.tab-panel.active {
-  display: grid;
 }
 
 .sidebar {
@@ -260,7 +240,7 @@ button.link-btn:hover { text-decoration: underline; }
   margin: 6px 0;
 }
 
-#town-feedback-box, #rw-feedback-box {
+#rw-feedback-box {
   margin-top: 12px;
   padding-top: 12px;
   border-top: 1px dashed var(--border);
@@ -386,7 +366,6 @@ button.link-btn:hover { text-decoration: underline; }
     --text-muted: #9aa0a8;
   }
   body { background: #16181c; }
-  .tab-btn { background: var(--bg-card); }
   .sidebar select,
   .sidebar input[type="text"],
   .sidebar input[type="number"],
