@@ -123,11 +123,11 @@ def _parse_realworld_form():
     # meters) rather than a raw grid point count -- resolution_for_target_
     # spacing converts it to the (nx, ny) point count needed to hit that
     # spacing over this bounding box, each axis independently clamped to
-    # [MIN_GRID_RESOLUTION, MAX_GRID_RESOLUTION]. 80m matches the frontend's
-    # default and is a reasonable default pixel size for a typical
-    # neighborhood-scale box.
+    # [MIN_GRID_RESOLUTION, MAX_GRID_RESOLUTION]. 100m (one pixel = 100m x
+    # 100m) matches the frontend's default and is a reasonable default pixel
+    # size for a typical neighborhood-scale box.
     try:
-        resolution_meters = float(request.form.get("resolution_meters", 80))
+        resolution_meters = float(request.form.get("resolution_meters", 100))
     except ValueError:
         return {"error": "resolution_meters must be a number"}, 400
     if resolution_meters <= 0:

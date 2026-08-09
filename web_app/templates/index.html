@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GeoAI Agent</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
@@ -89,7 +90,7 @@
     <h3>Advanced options</h3>
 
     <label for="rw-resolution-meters">Pixel resolution (meters)</label>
-    <input id="rw-resolution-meters" type="number" value="80" min="1" step="any">
+    <input id="rw-resolution-meters" type="number" value="100" min="1" step="any">
     <p class="hint" id="rw-ground-resolution">~ grid points</p>
     <p class="hint">The ground distance between sample points -- a smaller number means more,
       closer-together samples. Elevation requests try USGS 3DEP first (genuinely ~1m LiDAR-derived
