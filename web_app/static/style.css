@@ -6,6 +6,8 @@
   --bg-card: #ffffff;
   --text: #1a1d21;
   --text-muted: #667;
+  --warning: #a15c00;
+  --warning-bg: #fff6e8;
   --radius: 8px;
 }
 
@@ -255,6 +257,15 @@ button.link-btn:hover { text-decoration: underline; }
 
 .status.error { color: #c0392b; }
 
+.warning-note {
+  color: var(--warning);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-weight: 500;
+}
+
 .map {
   height: 100%;
   width: 100%;
@@ -364,6 +375,8 @@ button.link-btn:hover { text-decoration: underline; }
     --bg-card: #24282e;
     --text: #e7e9ec;
     --text-muted: #9aa0a8;
+    --warning: #e8ab5c;
+    --warning-bg: #2e2610;
   }
   body { background: #16181c; }
   .sidebar select,

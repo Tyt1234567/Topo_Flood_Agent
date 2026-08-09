@@ -246,6 +246,7 @@ class RealWorldDataset:
         layer_descriptions: dict[str, str] | None = None,
         layer_sources: dict[str, str | None] | None = None,
         elevation_source: str = "open_meteo",
+        elevation_fallback_reason: str | None = None,
     ):
         # bounds = (lat_min, lat_max, lon_min, lon_max)
         self.name = name
@@ -263,6 +264,13 @@ class RealWorldDataset:
         # which live source an online-fetched "elevation" layer actually
         # came from ("open_meteo" or "usgs") -- same reason as above.
         self.elevation_source = elevation_source
+        # set only when elevation fell back to a LATER entry in the
+        # source-attempt list (e.g. "auto" tried Open-Meteo first, it
+        # failed, and USGS's much-more-limited grid cap was used instead) --
+        # the earlier attempt's error, so the caller can explain WHY the
+        # achieved grid is coarser than what was requested, rather than
+        # that just silently showing up as a smaller grid with no reason.
+        self.elevation_fallback_reason = elevation_fallback_reason
 
 
 def _grid(bounds: tuple[float, float, float, float], resolution: int | tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
@@ -567,6 +575,7 @@ def build_real_world_dataset(
     # may change below depending on what was actually reachable -- kept in
     # sync with what was ACTUALLY used, not just requested.
     actual_elevation_source = elevation_source
+    elevation_fallback_reason: str | None = None
 
     for layer_name, source in layer_sources.items():
         if source is not None:
@@ -591,13 +600,15 @@ def build_real_world_dataset(
                 attempts = [("open_meteo", resolution)]
 
             first_error = None
-            for source_name, attempt_resolution in attempts:
+            for attempt_idx, (source_name, attempt_resolution) in enumerate(attempts):
                 try:
                     fields[layer_name] = (
                         fetch_usgs_elevation_field(bounds, attempt_resolution) if source_name == "usgs"
                         else fetch_open_meteo_field("elevation", bounds, attempt_resolution)
                     )
                     actual_elevation_source = source_name
+                    if attempt_idx > 0 and first_error is not None:
+                        elevation_fallback_reason = str(first_error)
                     break
                 except Exception as exc:
                     if first_error is None:
@@ -618,4 +629,5 @@ def build_real_world_dataset(
     return RealWorldDataset(
         name=name, bounds=bounds, scalar_fields=fields, layer_descriptions=layer_descriptions,
         layer_sources=layer_sources, elevation_source=actual_elevation_source,
+        elevation_fallback_reason=elevation_fallback_reason,
     )
