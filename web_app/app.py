@@ -172,6 +172,32 @@ def _parse_realworld_form():
     return bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths, elevation_source
 
 
+def _elevation_fallback_note(dataset, primary_variable: str, requested_elevation_source: str) -> str | None:
+    """Explains WHY the achieved elevation grid may be much coarser than
+    what was requested: "auto" (the default) and "open_meteo" both try
+    Open-Meteo first, but if it fails (rate limit, outage) this silently
+    falls back to USGS -- which caps at MAX_USGS_GRID_RESOLUTION points per
+    axis (one HTTP request per point, no batch endpoint), far below
+    Open-Meteo's ceiling. Without this note, a target of e.g. 100m over a
+    normal-sized box (which needs an 80x80 grid) can come back as a 10x10
+    grid with no visible explanation -- easy to mistake for a grid-size bug
+    rather than an external rate limit. Returns None when the user
+    explicitly chose "usgs" themselves (its cap is then expected, not a
+    surprise) or when no fallback actually happened."""
+    if primary_variable != "elevation" or requested_elevation_source == "usgs":
+        return None
+    if dataset.elevation_source != "usgs":
+        return None
+    reason = f" ({dataset.elevation_fallback_reason})" if dataset.elevation_fallback_reason else ""
+    return (
+        f"Open-Meteo's elevation fetch failed{reason}, so this automatically fell back to USGS "
+        f"3DEP -- which caps at {MAX_USGS_GRID_RESOLUTION}x{MAX_USGS_GRID_RESOLUTION} points (one "
+        "HTTP request per point, no batch endpoint), so the grid actually returned is much smaller "
+        "than the requested resolution. This is usually a temporary Open-Meteo rate limit -- try "
+        "again in a bit, or lower the resolution / shrink the bounding box to fit within USGS's cap."
+    )
+
+
 @app.route("/api/realworld/load_data", methods=["POST"])
 def realworld_load_data():
     parsed = _parse_realworld_form()
@@ -192,7 +218,6 @@ def realworld_load_data():
 
     dataset_id = _cache_dataset(dataset)
     layers = {name: {"field": field_to_geojson(field)} for name, field in dataset.scalar_fields.items()}
-    fell_back = primary_variable == "elevation" and elevation_source == "open_meteo" and dataset.elevation_source == "usgs"
 
     lat_min, lat_max, lon_min, lon_max = bounds
     return jsonify({
@@ -200,10 +225,7 @@ def realworld_load_data():
         "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
         "layers": layers,
         "elevation_source": dataset.elevation_source,
-        "elevation_source_fallback_note": (
-            "Open-Meteo's elevation API failed (rate limit or outage), so this automatically "
-            "used USGS 3DEP instead."
-        ) if fell_back else None,
+        "elevation_source_fallback_note": _elevation_fallback_note(dataset, primary_variable, elevation_source),
     })
 
 
@@ -211,6 +233,13 @@ def realworld_load_data():
 def realworld_analyze():
     dataset_id = request.form.get("dataset_id", "").strip()
     cached = _get_cached_dataset(dataset_id) if dataset_id else None
+    # what the user actually asked for -- kept separate from `elevation_source`
+    # below, which gets overwritten with what was ACTUALLY used, so the
+    # fallback note can still tell an explicit "usgs" choice (no surprise)
+    # from an "auto"/"open_meteo" request that silently landed on usgs.
+    requested_elevation_source = request.form.get("elevation_source", "auto")
+    if requested_elevation_source not in ("auto", "open_meteo", "usgs"):
+        requested_elevation_source = "auto"
 
     if cached is not None:
         dataset = cached
@@ -292,6 +321,7 @@ def realworld_analyze():
         "layers": layers,
         "recommendation": recommendation,
         "elevation_source": elevation_source,
+        "elevation_source_fallback_note": _elevation_fallback_note(dataset, primary_variable, requested_elevation_source),
     })
 
 

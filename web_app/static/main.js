@@ -279,6 +279,12 @@ function renderRealworldResult(data) {
     sourceNote.textContent = `Elevation data source actually used: ${data.elevation_source}`;
     summaryContainer.appendChild(sourceNote);
   }
+  if (data.elevation_source_fallback_note) {
+    const fallbackNote = document.createElement("p");
+    fallbackNote.className = "hint warning-note";
+    fallbackNote.textContent = data.elevation_source_fallback_note;
+    summaryContainer.appendChild(fallbackNote);
+  }
 
   let first = true;
   for (const [name, layer] of Object.entries(data.layers)) {
