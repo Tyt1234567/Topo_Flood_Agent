@@ -217,7 +217,10 @@ def realworld_load_data():
             Path(p).unlink(missing_ok=True)
 
     dataset_id = _cache_dataset(dataset)
-    layers = {name: {"field": field_to_geojson(field)} for name, field in dataset.scalar_fields.items()}
+    layers = {
+        name: {"field": field_to_geojson(field), "shape": list(field.shape)}
+        for name, field in dataset.scalar_fields.items()
+    }
 
     lat_min, lat_max, lon_min, lon_max = bounds
     return jsonify({

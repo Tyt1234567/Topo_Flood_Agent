@@ -166,6 +166,7 @@ async function loadRawDataPreview() {
       if (first) { field.addTo(realworldMap); first = false; }
     }
     realworldLayerControl = L.control.layers(null, realworldOverlays, { collapsed: false }).addTo(realworldMap);
+    showAchievedResolution(data);
     setStatus("rw-status", data.elevation_source_fallback_note ||
       "Raw data loaded -- click \"Fetch & Analyze\" to find critical points.");
   } catch (err) {
@@ -184,6 +185,30 @@ async function loadRawDataPreview() {
 function invalidateRwDataset() {
   rwDatasetId = null;
   rwElevationSource = "auto";
+  document.getElementById("rw-achieved-resolution").textContent = "";
+}
+
+// The estimate above (updateGroundResolutionHint) is only ever a PRE-fetch
+// target computed from the input fields -- it has no idea whether the live
+// fetch actually hit that target or fell back to a much smaller grid (e.g.
+// Open-Meteo failing and USGS's tighter point-count cap kicking in). Without
+// this, the Advanced options panel keeps showing the original target (e.g.
+// "~80x80 grid, 6400 points") even after a fetch that actually delivered
+// far fewer points, which reads as a bug rather than an honest source
+// fallback. Called after both load_data and analyze, since either can be
+// the first live response for a given request.
+function showAchievedResolution(data) {
+  const el = document.getElementById("rw-achieved-resolution");
+  const variable = document.getElementById("rw-variable").value;
+  const layer = data.layers && data.layers[variable];
+  const shape = layer && (layer.summary ? layer.summary.shape : layer.shape);
+  if (!shape) {
+    el.textContent = "";
+    return;
+  }
+  const [ny, nx] = shape;
+  el.innerHTML = `<b>Actually delivered:</b> ${nx}x${ny} grid (${nx * ny} points)` +
+    (data.elevation_source_fallback_note ? " -- smaller than requested, see the note below." : ".");
 }
 ["rw-bounds", "rw-variable", "rw-resolution-meters"].forEach((id) => {
   document.getElementById(id).addEventListener("input", invalidateRwDataset);
@@ -269,6 +294,7 @@ function renderRealworldResult(data) {
     realworldMap.removeLayer(sqPreviewRect);
     sqPreviewRect = null;
   }
+  showAchievedResolution(data);
 
   const summaryContainer = document.getElementById("rw-layer-summaries");
   summaryContainer.innerHTML = "";
