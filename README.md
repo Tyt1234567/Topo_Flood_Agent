@@ -34,26 +34,39 @@ against each other when recommending which bridge to protect first.
 The same dataset also carries three continuous scalar fields sampled on a
 grid over the town (synthetic terrain elevation, flood hazard intensity, and
 population density). These feed the `morse_needed` branch, which runs a
-from-scratch discrete Morse theory engine (`geoai_agent/morse_topology.py`)
-to find critical points (basins, peaks, saddles) and rank them by
-topological persistence, so the agent can tell a real feature (e.g. an
-actual flood-accumulation basin) from noise (a boundary artifact or a minor
-bump). The approach follows the discrete-Morse / persistence-based terrain
-analysis methodology of the UMIACS GeoVis Lab (https://geovis.umiacs.io/,
-e.g. `FormanGradient2D`, `Terrain_Trees`), reimplemented natively in Python
-so it runs on any scalar field, not just terrain.
+real discrete Morse-Smale complex via TTK (the Topology ToolKit,
+`geoai_agent/ttk_engine.py`) to find critical points (basins, peaks,
+saddles) and rank them by topological persistence, so the agent can tell a
+real feature (e.g. an actual flood-accumulation basin) from noise (a
+boundary artifact or a minor bump). A from-scratch pure-Python
+reimplementation of the same PL-Morse/persistence/watershed methodology
+(following the UMIACS GeoVis Lab's approach, https://geovis.umiacs.io/,
+e.g. `FormanGradient2D`, `Terrain_Trees`) is kept at
+`geoai_agent/morse_topology.py` as a reference/fallback, but is no longer
+what the pipeline actually calls.
+
+On top of that, `geoai_agent/flood_tools.py` turns the Morse-Smale basins
+of a real elevation field into a flood-risk / drainage-demand analysis:
+every significant depression is scored (topological persistence,
+contributing area, slope, a selectable design-storm rainfall scenario, and
+an optional exposure layer) and given a Rational-Method drainage demand.
+See `web_app/`'s "Flood & drainage analysis" panel for the HITL controls
+(rainfall scenario, life-safety-vs-infrastructure weighting).
 
 ## Requirements
 
 - Python 3.11+
-- [Ollama](https://ollama.com) running locally with `qwen2.5:7b-instruct` pulled:
-  ```
-  ollama pull qwen2.5:7b-instruct
-  ```
+- A free-tier Gemini API key (https://aistudio.google.com/apikey), set as
+  the `GEMINI_API_KEY` environment variable
 - Python packages:
   ```
   pip install -r requirements.txt
   ```
+- For the discrete-Morse (`morse_needed`) branch and flood/drainage
+  analysis: TTK (the Topology ToolKit, https://topology-tool-kit.github.io/),
+  installed in a separate Python environment with its VTK-based Python
+  bindings (`geoai_agent/ttk_engine.py` shells out to it as a subprocess --
+  see `TTK_PYTHON` / `TTK_BIN_DIR` in that file to point it at your install)
 
 ## Usage
 
@@ -89,11 +102,14 @@ human review loop as the topology branch.
 | `geoai_agent/data.py` | Synthetic GIS dataset: road graph, hazard polygon, zones, population points, and scalar fields (elevation, hazard intensity, population density) |
 | `geoai_agent/geometry_tools.py` | Standard GIS tools for the geometry-sufficient branch (area, distance, containment, buffer) |
 | `geoai_agent/topology_tools.py` | Connectivity, adjacency, and critical-structure (graph bridge) analysis over the discrete network |
-| `geoai_agent/morse_topology.py` | Discrete Morse theory over continuous scalar fields: critical point classification, persistence pairing, watershed segmentation |
-| `geoai_agent/real_data.py` | Real-world scalar field layers: online elevation fetch (Open-Meteo), user-CSV layers via IDW interpolation, derived slope layer |
-| `geoai_agent/visualize.py` | Self-contained multi-layer Leaflet map generation for Morse analysis results |
+| `geoai_agent/morse_topology.py` | Pure-Python discrete Morse engine (reference/fallback, not the active path): critical point classification, persistence pairing, watershed segmentation |
+| `geoai_agent/ttk_engine.py` | Active Morse-Smale engine: shells out to a TTK-equipped Python environment as a subprocess, returns the same result shape as `morse_topology.analyze_scalar_field` plus separatrices |
+| `geoai_agent/_ttk_worker.py` | Runs inside the TTK environment only -- builds a vtkImageData from a `ScalarField`, runs TTK's persistence-simplification + Morse-Smale complex |
+| `geoai_agent/flood_tools.py` | Flood-risk / drainage-demand domain engine on top of a Morse-Smale result: weighted risk scoring, Rational-Method runoff, rainfall scenarios, HITL weight presets |
+| `geoai_agent/real_data.py` | Real-world scalar field layers: online elevation fetch (USGS 3DEP / Open-Meteo), user-CSV layers via IDW interpolation, derived slope layer |
+| `geoai_agent/visualize.py` | Self-contained multi-layer Leaflet map generation for Morse analysis and flood-hotspot results |
 | `geoai_agent/integration.py` | Combines topology output with hazard/population/accessibility per structure |
-| `geoai_agent/llm_client.py` | OpenAI-compatible client targeting a local Ollama server |
+| `geoai_agent/llm_client.py` | Gemini API client (google-genai SDK) |
 | `geoai_agent/prompts.py` | System prompts and JSON schemas for each LLM-driven step |
 | `geoai_agent/agent.py` | Orchestrator implementing the full pipeline and the human feedback re-run loop |
 | `main.py` | CLI entry point (synthetic town) |
@@ -170,15 +186,25 @@ the town's road graph and zones and has no real-world equivalent here.
 
 ## Configuration
 
-The LLM backend defaults to `http://localhost:11434/v1` with model
-`qwen2.5:7b-instruct`. To use a different OpenAI-compatible endpoint (e.g.
-DeepSeek), construct `GeoAIAgent` with a custom `LLMClient`:
+The LLM backend is Gemini (`geoai_agent/llm_client.py`, via the
+`google-genai` SDK), reading the API key from the `GEMINI_API_KEY`
+environment variable and defaulting to a pinned stable model
+(`LLMClient.DEFAULT_MODEL`) rather than a `-latest` alias -- Google's
+`-latest` aliases can point at a brand-new preview model with a much
+tighter free-tier daily quota than an established stable snapshot. To use
+a different model or a separate API key, construct `GeoAIAgent` with a
+custom `LLMClient`:
 
 ```python
 from geoai_agent.agent import GeoAIAgent
 from geoai_agent.llm_client import LLMClient
 
-llm = LLMClient(model="deepseek-chat", base_url="https://api.deepseek.com", api_key="...")
+llm = LLMClient(model="gemini-3.5-flash", api_key="...")
 agent = GeoAIAgent(llm_client=llm)
 agent.run("your query")
 ```
+
+The Morse-Smale engine (`geoai_agent/ttk_engine.py`) looks for TTK's
+Python environment at `D:\anaconda3\envs\tda_env\python.exe` /
+`D:\TTK\bin` by default -- override with the `TTK_PYTHON` / `TTK_BIN_DIR`
+environment variables if your install lives elsewhere.

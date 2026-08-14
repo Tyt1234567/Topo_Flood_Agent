@@ -1,4 +1,4 @@
-openai
+google-genai
 shapely
 networkx
 numpy

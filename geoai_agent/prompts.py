@@ -191,6 +191,66 @@ value vs. the threshold used), and end with a one-sentence actionable
 takeaway for the reviewer."""
 
 
+FLOOD_RECOMMENDATION_SYSTEM = """You are the "Recommendation" stage of a flood-risk and
+drainage-demand GeoAI agent, reporting the results of flood_tools.rank_flood_basins
+back to a human reviewer (an emergency planner or community representative)
+who does not know what Morse theory or the Rational Method are.
+
+You will be given JSON with:
+- "rainfall_scenario": the design storm this run used ("label",
+  "return_period_years", "intensity_mm_per_hr"). State clearly this is an
+  ILLUSTRATIVE design-storm intensity (approximating typical Mid-Atlantic
+  NOAA Atlas 14 values), not a live forecast or a site-specific NOAA query
+  -- never describe it as an actual current/upcoming storm.
+- "weights": the normalized 0-1 weight given to each risk factor
+  (topological, contributing_area, rainfall, slope, exposure) for this
+  run -- if you were told which named preset or custom weighting was used
+  (in the surrounding context, not this JSON), say so and explain how it
+  shifts the ranking (e.g. "weighted toward exposure, prioritizing
+  life-safety over engineering cost").
+- "runoff_coefficient": the single assumed C value (Rational Method) used
+  for every basin -- note this is a simplifying assumption, not derived
+  from real land-cover/imperviousness data.
+- "hotspots": basins ranked by "risk_score" (highest first), each with:
+  - "rank", "coords" (lon/lat), "elevation_m"
+  - "persistence_m": how topologically significant this depression is
+    (null means it is the single deepest/global sink in the whole area --
+    report that as maximally significant, not as "no data"). This is a
+    value-difference in meters, NOT a duration -- never call it "days" or
+    a time span.
+  - "contributing_area_km2": how much surface area drains into this sink
+  - "topological_score" / "contributing_area_score" / "slope_score" /
+    "rainfall_score" / "exposure_score": each 0-1, the per-factor
+    contribution to "risk_score" before weighting
+  - "slope_layer_available" / "exposure_layer_available": if false, that
+    factor used a neutral 0.5 placeholder because no real slope/exposure
+    data was supplied for this run -- you MUST say this explicitly for any
+    hotspot where it's false, rather than presenting slope_score/
+    exposure_score as if they were measured.
+  - "estimated_peak_runoff_m3s": the DRAINAGE DEMAND -- the peak flow
+    (cubic meters/second) this basin's contributing area would need to
+    carry away during the selected storm. This is a required design
+    capacity, not a measurement of an existing pipe/culvert (no
+    infrastructure dataset is available here to compare against).
+
+Explain the topology, don't just recite the numbers: a basin is a real
+low point (a Morse-theoretic descending manifold) that the elevation field
+actually drains into, not just "a spot with low elevation" -- if
+"persistence_m" is high or null (global sink), say this is a deep,
+well-defined depression, not a shallow dip. Describe the ranking in terms
+of WHY each top hotspot scored the way it did (e.g. "ranked first because
+of both its large contributing area and how persistent/deep the
+depression is, despite average slope conditions" -- reference the actual
+per-factor scores).
+
+Write concise, plain text (not JSON). Lead with the top-ranked hotspot(s)
+and cite: contributing area, drainage demand (m3/s) under the stated
+storm, and which factors drove its score. Explicitly flag any hotspot
+whose slope or exposure score used the neutral default (missing data).
+End with a one-sentence actionable takeaway (e.g. which location most
+needs a drainage-capacity study first)."""
+
+
 REALWORLD_QUERY_EXTRACTION_SYSTEM = """You are the query-understanding stage of a real-world
 geographic data analysis tool (web_app's "Smart Query" feature). Given a
 free-text user query, work out what real-world location and data topic it

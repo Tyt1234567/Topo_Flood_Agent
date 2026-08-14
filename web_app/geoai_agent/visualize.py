@@ -116,6 +116,29 @@ def critical_points_to_geojson(result: dict, significant_only: bool = True) -> d
     return {"type": "FeatureCollection", "features": features}
 
 
+def flood_hotspots_to_geojson(hotspots: list[dict]) -> dict:
+    """Point features for a flood_tools.rank_flood_basins() result's
+    "hotspots" list, colored by risk_score (same viridis-ish ramp as
+    field_to_geojson's heatmap, so a reader doesn't have to learn a second
+    color scale)."""
+    features = []
+    for h in hotspots:
+        x, y = h["coords"]
+        features.append({
+            "type": "Feature",
+            "properties": {
+                "rank": h["rank"],
+                "risk_score": h["risk_score"],
+                "contributing_area_km2": h["contributing_area_km2"],
+                "estimated_peak_runoff_m3s": h["estimated_peak_runoff_m3s"],
+                "persistence_m": h["persistence_m"],
+                "color": _ramp_color(h["risk_score"]),
+            },
+            "geometry": {"type": "Point", "coordinates": [x, y]},
+        })
+    return {"type": "FeatureCollection", "features": features}
+
+
 def render_leaflet_map(
     fields: dict[str, ScalarField],
     results: dict[str, dict],

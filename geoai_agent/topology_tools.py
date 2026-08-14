@@ -15,14 +15,14 @@ determines geometry alone is not sufficient:
 This module handles topology of the *discrete network* (graph, polygons).
 For topology of *continuous scalar fields* (elevation, hazard intensity,
 population density -- critical points, persistence, watershed basins via
-discrete Morse theory) see geoai_agent/morse_topology.py, invoked below
-through analyze_scalar_topology.
+discrete Morse theory) see geoai_agent/ttk_engine.py (TTK-backed Morse-Smale
+complex), invoked below through analyze_scalar_topology.
 """
 
 import networkx as nx
 
 from geoai_agent.data import GeoDataset
-from geoai_agent.morse_topology import analyze_scalar_field
+from geoai_agent.ttk_engine import analyze_scalar_field_ttk
 
 
 def analyze_connectivity(dataset: GeoDataset) -> dict:
@@ -83,11 +83,11 @@ def analyze_critical_structures(dataset: GeoDataset) -> dict:
 def analyze_scalar_topology(dataset: GeoDataset, field_name: str, persistence_threshold: float | None = None) -> dict:
     """Discrete-Morse topological analysis of one scalar field in the
     dataset (elevation, hazard_intensity, population_density, or any other
-    field later added to GeoDataset.scalar_fields). See morse_topology.py."""
+    field later added to GeoDataset.scalar_fields). See ttk_engine.py."""
     field = dataset.scalar_fields.get(field_name)
     if field is None:
         return {"error": f"unknown scalar field '{field_name}'", "available_fields": list(dataset.scalar_fields)}
-    return analyze_scalar_field(field, persistence_threshold=persistence_threshold)
+    return analyze_scalar_field_ttk(field, persistence_threshold=persistence_threshold)
 
 
 def run_topology_analysis(dataset: GeoDataset) -> dict:

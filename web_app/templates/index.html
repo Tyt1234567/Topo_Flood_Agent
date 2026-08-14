@@ -56,6 +56,38 @@
         <div id="rw-layer-summaries"></div>
         <h3>Recommendation</h3>
         <pre id="rw-recommendation"></pre>
+
+        <h3>Flood &amp; drainage analysis</h3>
+        <p class="hint">Ranks every significant topological depression in the elevation layer above
+          as a flood hotspot, and estimates its Rational-Method drainage demand under a design storm.
+          Needs Topic = elevation, fetched above first.</p>
+        <div class="settings-row">
+          <label for="flood-rainfall">Design storm</label>
+          <select id="flood-rainfall">
+            <option value="2yr">2-year</option>
+            <option value="10yr" selected>10-year</option>
+            <option value="25yr">25-year</option>
+            <option value="50yr">50-year</option>
+            <option value="100yr">100-year</option>
+            <option value="500yr">500-year</option>
+          </select>
+        </div>
+        <div class="settings-row">
+          <label for="flood-weights">Priority (HITL weighting)</label>
+          <select id="flood-weights">
+            <option value="balanced" selected>Balanced</option>
+            <option value="life_safety">Life safety first</option>
+            <option value="infrastructure_protection">Infrastructure / engineering first</option>
+          </select>
+        </div>
+        <button id="flood-submit" class="primary">Analyze flood risk</button>
+        <div id="flood-status" class="status"></div>
+        <div id="flood-result" hidden>
+          <div id="flood-hotspot-table"></div>
+          <h4>Recommendation</h4>
+          <pre id="flood-recommendation"></pre>
+        </div>
+
         <div id="rw-feedback-box">
           <label for="rw-feedback">Not satisfied? Say what's wrong -- re-runs the analysis with
             this folded into the recommendation</label>

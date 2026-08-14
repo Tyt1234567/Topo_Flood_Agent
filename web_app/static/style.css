@@ -364,6 +364,30 @@ button.link-btn:hover { text-decoration: underline; }
 
 .leaflet-popup-content { font-size: 12px; }
 
+.flood-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin: 8px 0;
+}
+
+.flood-table th,
+.flood-table td {
+  padding: 5px 6px;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+}
+
+.flood-table th:first-child,
+.flood-table td:first-child {
+  text-align: left;
+}
+
+.flood-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
 /* -- dark mode ------------------------------------------------------------- */
 
 @media (prefers-color-scheme: dark) {

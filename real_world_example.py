@@ -24,7 +24,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from geoai_agent import prompts
 from geoai_agent.llm_client import LLMClient
-from geoai_agent.morse_topology import analyze_scalar_field
+from geoai_agent.ttk_engine import analyze_scalar_field_ttk
 from geoai_agent.real_data import build_real_world_dataset
 from geoai_agent.visualize import render_leaflet_map
 
@@ -101,7 +101,7 @@ def main() -> None:
     results = {}
     for layer_name, field in dataset.scalar_fields.items():
         print(f"\n--- Morse analysis: {layer_name} ---")
-        result = analyze_scalar_field(field)
+        result = analyze_scalar_field_ttk(field)
         results[layer_name] = result
         print(json.dumps({
             "value_range": result["value_range"],

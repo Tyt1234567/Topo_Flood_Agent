@@ -33,8 +33,9 @@ APP_DIR = Path(__file__).resolve().parent
 from flask import Flask, jsonify, render_template, request
 
 from geoai_agent import prompts
+from geoai_agent.flood_tools import RAINFALL_SCENARIOS, WEIGHT_PRESETS, rank_flood_basins
 from geoai_agent.llm_client import LLMClient
-from geoai_agent.morse_topology import analyze_scalar_field
+from geoai_agent.ttk_engine import analyze_scalar_field_ttk
 from geoai_agent.real_data import (
     MAX_USGS_GRID_RESOLUTION,
     OPEN_METEO_VARIABLES,
@@ -45,7 +46,7 @@ from geoai_agent.real_data import (
     is_in_continental_us,
     resolution_for_target_spacing,
 )
-from geoai_agent.visualize import critical_points_to_geojson, field_to_geojson
+from geoai_agent.visualize import critical_points_to_geojson, field_to_geojson, flood_hotspots_to_geojson
 
 app = Flask(__name__)
 
@@ -270,7 +271,7 @@ def realworld_analyze():
                 Path(p).unlink(missing_ok=True)
         elevation_source = dataset.elevation_source  # may have been upgraded by an automatic fallback
 
-    results = {name: analyze_scalar_field(field) for name, field in dataset.scalar_fields.items()}
+    results = {name: analyze_scalar_field_ttk(field) for name, field in dataset.scalar_fields.items()}
 
     recommendation = None
     if request.form.get("recommend") == "true" and primary_variable in results:
@@ -284,8 +285,10 @@ def realworld_analyze():
                 live_source = "the live Open-Meteo API (not pre-downloaded or cached)"
             context = (
                 f"'{primary_variable}' data for this run came from {live_source}. Basins/peaks were "
-                "computed by persistence-guided steepest-descent/ascent watershed directly on the raw "
-                "field, with NO heuristic depression-filling or breaching preprocessing.\n"
+                "computed by TTK (Topology ToolKit)'s Morse-Smale complex: persistence-based "
+                "topological simplification at the reported threshold, then critical points and "
+                "descending/ascending manifolds (basins/peak catchments) on the simplified field -- "
+                "no heuristic depression-filling or breaching preprocessing.\n"
                 f"Morse analysis result: {json.dumps(results[primary_variable], ensure_ascii=False)}"
             )
             if layer_descriptions:
@@ -325,6 +328,112 @@ def realworld_analyze():
         "recommendation": recommendation,
         "elevation_source": elevation_source,
         "elevation_source_fallback_note": _elevation_fallback_note(dataset, primary_variable, requested_elevation_source),
+    })
+
+
+# -- Flood & Drainage Analysis: HITL rainfall-scenario / weight-preset ---
+# controls over the same elevation layer -- a Track-A-style domain module
+# on top of the generic Morse analysis above: every significant basin
+# (topological depression) becomes a candidate flood hotspot, ranked by a
+# weighted risk score and given a Rational-Method drainage demand under
+# the selected design storm. See geoai_agent/flood_tools.py.
+#
+# Reuses the same dataset_id cache as /analyze (a location loaded via
+# /load_data or /analyze also serves this), so switching between the
+# generic Morse view and this one doesn't re-fetch live data.
+
+@app.route("/api/realworld/flood_analyze", methods=["POST"])
+def realworld_flood_analyze():
+    dataset_id = request.form.get("dataset_id", "").strip()
+    cached = _get_cached_dataset(dataset_id) if dataset_id else None
+    requested_elevation_source = request.form.get("elevation_source", "auto")
+    if requested_elevation_source not in ("auto", "open_meteo", "usgs"):
+        requested_elevation_source = "auto"
+
+    if cached is not None:
+        dataset = cached
+        bounds = dataset.bounds
+        tmp_paths = []
+    else:
+        parsed = _parse_realworld_form()
+        if isinstance(parsed[0], dict):
+            return jsonify(parsed[0]), parsed[1]
+        bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths, elevation_source = parsed
+        layer_sources = {**layer_sources, "elevation": layer_sources.get("elevation") or None}
+        try:
+            dataset = build_real_world_dataset(
+                "web_request", bounds, layer_sources, resolution=resolution,
+                layer_descriptions=layer_descriptions, elevation_source=elevation_source,
+            )
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            for p in tmp_paths:
+                Path(p).unlink(missing_ok=True)
+
+    elevation_field = dataset.scalar_fields.get("elevation")
+    if elevation_field is None:
+        return jsonify({
+            "error": "No elevation layer is loaded for this location -- flood analysis needs terrain "
+                     "elevation. Set Topic to \"elevation\" and Fetch & Analyze first."
+        }), 400
+
+    rainfall_scenario = request.form.get("rainfall_scenario", "10yr")
+    if rainfall_scenario not in RAINFALL_SCENARIOS:
+        return jsonify({"error": f"unknown rainfall_scenario, available: {list(RAINFALL_SCENARIOS)}"}), 400
+    weight_preset = request.form.get("weight_preset", "balanced")
+    if weight_preset not in WEIGHT_PRESETS:
+        return jsonify({"error": f"unknown weight_preset, available: {list(WEIGHT_PRESETS)}"}), 400
+    try:
+        runoff_coefficient = float(request.form.get("runoff_coefficient", 0.5))
+    except ValueError:
+        return jsonify({"error": "runoff_coefficient must be a number"}), 400
+
+    slope_field = dataset.scalar_fields.get("slope")
+    exposure_field = dataset.scalar_fields.get("exposure") or dataset.scalar_fields.get("population")
+
+    morse_result = analyze_scalar_field_ttk(elevation_field)
+    flood = rank_flood_basins(
+        elevation_field, morse_result, rainfall_scenario=rainfall_scenario, weights=weight_preset,
+        runoff_coefficient=runoff_coefficient, slope_field=slope_field, exposure_field=exposure_field,
+    )
+
+    recommendation = None
+    if request.form.get("recommend") == "true":
+        try:
+            llm = LLMClient()
+            context = (
+                f"Weight preset used: '{weight_preset}'. Slope layer available: {slope_field is not None}. "
+                f"Exposure layer available: {exposure_field is not None}.\n"
+                f"Flood risk ranking result: {json.dumps(flood, ensure_ascii=False)}"
+            )
+            feedback = request.form.get("feedback", "").strip()
+            if feedback:
+                context += "\n\n" + prompts.RERUN_CONTEXT_TEMPLATE.format(
+                    feedback=feedback,
+                    original_query=f"Rank flood risk / drainage demand over bounds {bounds}",
+                )
+            recommendation = llm.chat(prompts.FLOOD_RECOMMENDATION_SYSTEM, context)
+        except Exception as exc:
+            recommendation = f"(recommendation unavailable: {exc})"
+
+    lat_min, lat_max, lon_min, lon_max = bounds
+    return jsonify({
+        "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
+        "rainfall_scenario": flood["rainfall_scenario"],
+        "weights": flood["weights"],
+        "weight_preset": weight_preset,
+        "runoff_coefficient": flood["runoff_coefficient"],
+        "hotspots": flood["hotspots"],
+        "hotspots_geojson": flood_hotspots_to_geojson(flood["hotspots"]),
+        "slope_layer_available": slope_field is not None,
+        "exposure_layer_available": exposure_field is not None,
+        "recommendation": recommendation,
+        "available_rainfall_scenarios": RAINFALL_SCENARIOS,
+        "available_weight_presets": list(WEIGHT_PRESETS),
+        "elevation_source": dataset.elevation_source,
+        "elevation_source_fallback_note": _elevation_fallback_note(dataset, "elevation", requested_elevation_source),
+        "elevation_grid_shape": list(elevation_field.shape),
     })
 
 

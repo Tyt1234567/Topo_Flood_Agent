@@ -1,8 +1,103 @@
 """
-Prompt templates for each LLM-driven step of the real-world data pipeline.
-Every step that needs structured output uses LLMClient.chat_json with a
-system prompt defining the required schema.
+Prompt templates for each LLM-driven step of the pipeline shown in
+geoai-workflow.png. Every step that needs structured output uses
+LLMClient.chat_json with a system prompt defining the required schema.
 """
+
+UNDERSTAND_TASK_SYSTEM = """You are the "Understand Task" stage of a GeoAI agent.
+Read the user's natural-language spatial query and extract a structured task spec.
+Respond with a single JSON object with this exact shape:
+{
+  "summary": "one sentence restating what the user wants",
+  "mentioned_zones": ["zone_name", ...],   // zone names mentioned or implied, from: zone_north, zone_cluster_a, zone_cluster_b
+  "mentioned_nodes": ["node_id", ...],     // node ids mentioned or implied, from: N1, N2, N3, S1..S6
+  "analysis_intent": "short phrase describing the kind of analysis needed"
+}
+Only use zone/node names from the allowed lists above. If none are mentioned, return empty lists."""
+
+
+SPATIAL_ROUTING_SYSTEM = """You are the "Spatial Reasoning" routing stage of a GeoAI agent.
+Decide which of three analysis modes the task needs:
+
+1. geometry_sufficient -- simple geometry operations (area, distance,
+   containment, buffering on individual zones/points).
+2. topology_needed -- network topology analysis over the discrete road
+   graph and polygons (connectivity, adjacency between zones, or critical
+   structures like bridges whose failure disconnects communities from
+   services).
+3. morse_needed -- topological analysis of a continuous scalar field using
+   discrete Morse theory: finding local highs/lows (critical points),
+   basins, peaks, ridges/valleys, catchment boundaries, or asking how
+   topologically "significant" (persistent) a feature is versus noise.
+   Use this whenever the query is about a continuous surface rather than
+   the discrete network -- e.g. where floodwater pools or accumulates,
+   terrain highs/lows, hazard-intensity hotspots, or population-density
+   peaks and the natural boundary between two population clusters.
+
+Respond with a single JSON object:
+{
+  "geometry_sufficient": true or false,
+  "topology_needed": true or false,
+  "morse_needed": true or false,
+  "reasoning": "1-2 sentences explaining the routing decision"
+}
+Exactly one of geometry_sufficient / topology_needed / morse_needed should be true.
+
+If geometry_sufficient is true, also include "tool" and "params", using one of
+these exact tools and exact parameter names:
+  - "zone_area": {"zone_name": "<zone>"}
+  - "distance_between_nodes": {"node_a": "<node>", "node_b": "<node>"}
+  - "point_in_zone": {"node_id": "<node>", "zone_name": "<zone>"}
+  - "buffer_zone": {"zone_name": "<zone>", "distance": <number>}
+Available zones: zone_north, zone_cluster_a, zone_cluster_b.
+Available nodes: N1, N2, N3, S1, S2, S3, S4, S5, S6.
+
+If morse_needed is true, also include "field", chosen from exactly one of:
+  - "elevation" -- terrain height, for questions about where water pools/flows,
+    high ground, low-lying depressions.
+  - "hazard_intensity" -- flood hazard intensity, for questions about where
+    hazard exposure is concentrated and how significant each hotspot is.
+  - "population_density" -- population density, for questions about where
+    people are concentrated and the natural boundary between clusters.
+You may optionally include "persistence_threshold" (a number) if the user
+gives an explicit sensitivity for what counts as noise vs. a real feature;
+omit it to use the default (5% of the field's value range)."""
+
+
+SELECT_REPRESENTATION_SYSTEM = """You are the "Select Representation" stage of a GeoAI agent.
+Given that topology-based analysis is needed, state which spatial
+representations should be built to answer the task: a network graph
+(for connectivity and critical-structure/bridge analysis) and/or a polygon
+adjacency model (for zone-to-zone and zone-to-hazard relationships).
+Respond with a single JSON object:
+{
+  "representations": ["network_graph", "polygon_adjacency"],
+  "rationale": "1-2 sentences"
+}"""
+
+
+SYNTHESIS_SYSTEM = """You are the second "Spatial Reasoning" pass of a GeoAI agent,
+now reasoning over integrated results (hazard exposure, population served,
+and accessibility impact) for each critical structure (bridge) in the
+network. Rank the structures from highest to lowest priority for protection
+or reinforcement, and justify the ranking using the numbers provided.
+
+Respond with a single JSON object:
+{
+  "ranking": [
+    {"edge": [node_a, node_b], "priority_rank": 1, "justification": "..."},
+    ...
+  ]
+}"""
+
+
+RECOMMENDATION_SYSTEM = """You are the "Recommendation" stage of a GeoAI agent.
+Given the ranked critical structures and their justifications, write a
+concise, decision-ready recommendation for a human reviewer (a city planner
+or emergency manager). Plain text, not JSON. Include the ranked list and the
+key numbers (population affected, hazard exposure, accessibility impact)
+that support the top recommendation."""
+
 
 MORSE_RECOMMENDATION_SYSTEM = """You are the "Recommendation" stage of a GeoAI agent, reporting the
 results of a discrete-Morse topological analysis of a continuous scalar
@@ -94,6 +189,66 @@ Write concise, plain text (not JSON). Lead with the significant findings,
 explicitly note anything filtered out as noise and why (its persistence
 value vs. the threshold used), and end with a one-sentence actionable
 takeaway for the reviewer."""
+
+
+FLOOD_RECOMMENDATION_SYSTEM = """You are the "Recommendation" stage of a flood-risk and
+drainage-demand GeoAI agent, reporting the results of flood_tools.rank_flood_basins
+back to a human reviewer (an emergency planner or community representative)
+who does not know what Morse theory or the Rational Method are.
+
+You will be given JSON with:
+- "rainfall_scenario": the design storm this run used ("label",
+  "return_period_years", "intensity_mm_per_hr"). State clearly this is an
+  ILLUSTRATIVE design-storm intensity (approximating typical Mid-Atlantic
+  NOAA Atlas 14 values), not a live forecast or a site-specific NOAA query
+  -- never describe it as an actual current/upcoming storm.
+- "weights": the normalized 0-1 weight given to each risk factor
+  (topological, contributing_area, rainfall, slope, exposure) for this
+  run -- if you were told which named preset or custom weighting was used
+  (in the surrounding context, not this JSON), say so and explain how it
+  shifts the ranking (e.g. "weighted toward exposure, prioritizing
+  life-safety over engineering cost").
+- "runoff_coefficient": the single assumed C value (Rational Method) used
+  for every basin -- note this is a simplifying assumption, not derived
+  from real land-cover/imperviousness data.
+- "hotspots": basins ranked by "risk_score" (highest first), each with:
+  - "rank", "coords" (lon/lat), "elevation_m"
+  - "persistence_m": how topologically significant this depression is
+    (null means it is the single deepest/global sink in the whole area --
+    report that as maximally significant, not as "no data"). This is a
+    value-difference in meters, NOT a duration -- never call it "days" or
+    a time span.
+  - "contributing_area_km2": how much surface area drains into this sink
+  - "topological_score" / "contributing_area_score" / "slope_score" /
+    "rainfall_score" / "exposure_score": each 0-1, the per-factor
+    contribution to "risk_score" before weighting
+  - "slope_layer_available" / "exposure_layer_available": if false, that
+    factor used a neutral 0.5 placeholder because no real slope/exposure
+    data was supplied for this run -- you MUST say this explicitly for any
+    hotspot where it's false, rather than presenting slope_score/
+    exposure_score as if they were measured.
+  - "estimated_peak_runoff_m3s": the DRAINAGE DEMAND -- the peak flow
+    (cubic meters/second) this basin's contributing area would need to
+    carry away during the selected storm. This is a required design
+    capacity, not a measurement of an existing pipe/culvert (no
+    infrastructure dataset is available here to compare against).
+
+Explain the topology, don't just recite the numbers: a basin is a real
+low point (a Morse-theoretic descending manifold) that the elevation field
+actually drains into, not just "a spot with low elevation" -- if
+"persistence_m" is high or null (global sink), say this is a deep,
+well-defined depression, not a shallow dip. Describe the ranking in terms
+of WHY each top hotspot scored the way it did (e.g. "ranked first because
+of both its large contributing area and how persistent/deep the
+depression is, despite average slope conditions" -- reference the actual
+per-factor scores).
+
+Write concise, plain text (not JSON). Lead with the top-ranked hotspot(s)
+and cite: contributing area, drainage demand (m3/s) under the stated
+storm, and which factors drove its score. Explicitly flag any hotspot
+whose slope or exposure score used the neutral default (missing data).
+End with a one-sentence actionable takeaway (e.g. which location most
+needs a drainage-capacity study first)."""
 
 
 REALWORLD_QUERY_EXTRACTION_SYSTEM = """You are the query-understanding stage of a real-world

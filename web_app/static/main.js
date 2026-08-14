@@ -361,6 +361,91 @@ document.getElementById("rw-accept").addEventListener("click", () => {
   setStatus("rw-status", "Recommendation accepted.");
 });
 
+// -- Flood & drainage analysis (HITL rainfall-scenario / weight-preset) -----
+//
+// Reuses rwDatasetId if a location is already loaded (so this doesn't
+// re-fetch live data); otherwise sends the same bounds/topic fields the
+// main Fetch & Analyze action does, and the backend fetches fresh.
+
+function floodHotspotMarkers(geojson) {
+  return L.geoJSON(geojson, {
+    pointToLayer: (feature, latlng) =>
+      L.circleMarker(latlng, {
+        radius: 8, color: "#222", weight: 1,
+        fillColor: feature.properties.color, fillOpacity: 0.85,
+      }),
+    onEachFeature: (feature, layer) => {
+      const p = feature.properties;
+      layer.bindPopup(
+        `<b>Flood hotspot #${p.rank}</b><br>risk score: ${p.risk_score.toFixed(3)}` +
+        `<br>contributing area: ${p.contributing_area_km2.toFixed(3)} km&sup2;` +
+        `<br>estimated peak runoff: ${p.estimated_peak_runoff_m3s.toFixed(2)} m&sup3;/s` +
+        `<br>persistence: ${p.persistence_m === null ? "infinite (deepest sink)" : p.persistence_m.toFixed(2) + "m"}`
+      );
+    },
+  });
+}
+
+function renderFloodResult(data) {
+  const container = document.getElementById("flood-hotspot-table");
+  if (!data.hotspots.length) {
+    container.innerHTML = "<p class=\"hint\">No significant basins found -- nothing to rank.</p>";
+  } else {
+    const rows = data.hotspots.map((h) => `
+      <tr>
+        <td>${h.rank}</td>
+        <td>${h.risk_score.toFixed(3)}</td>
+        <td>${h.contributing_area_km2.toFixed(3)}</td>
+        <td>${h.estimated_peak_runoff_m3s.toFixed(2)}</td>
+        <td>${h.persistence_m === null ? "infinite" : h.persistence_m.toFixed(2)}</td>
+      </tr>`).join("");
+    container.innerHTML = `
+      <table class="flood-table">
+        <thead><tr><th>Rank</th><th>Risk score</th><th>Contrib. area (km&sup2;)</th>
+          <th>Peak runoff (m&sup3;/s)</th><th>Persistence (m)</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+  if (!data.slope_layer_available || !data.exposure_layer_available) {
+    const missing = [];
+    if (!data.slope_layer_available) missing.push("slope");
+    if (!data.exposure_layer_available) missing.push("exposure");
+    container.innerHTML += `<p class="hint">${missing.join(" and ")} not available for this run -- ` +
+      "those risk factors used a neutral default rather than real data.";
+  }
+
+  if (realworldOverlays["flood hotspots"]) realworldMap.removeLayer(realworldOverlays["flood hotspots"]);
+  const markers = floodHotspotMarkers(data.hotspots_geojson);
+  realworldOverlays["flood hotspots"] = markers;
+  markers.addTo(realworldMap);
+  if (realworldLayerControl) realworldMap.removeControl(realworldLayerControl);
+  realworldLayerControl = L.control.layers(null, realworldOverlays, { collapsed: false }).addTo(realworldMap);
+
+  document.getElementById("flood-result").hidden = false;
+  document.getElementById("flood-recommendation").textContent = data.recommendation || "(not requested)";
+}
+
+async function submitFloodAnalyze() {
+  const formData = buildRealworldFormData();
+  formData.append("rainfall_scenario", document.getElementById("flood-rainfall").value);
+  formData.append("weight_preset", document.getElementById("flood-weights").value);
+  formData.append("recommend", "true");
+  if (rwDatasetId) formData.append("dataset_id", rwDatasetId);
+
+  setStatus("flood-status", "Running Morse analysis and ranking flood hotspots...");
+  document.getElementById("flood-result").hidden = true;
+  try {
+    const res = await fetch("/api/realworld/flood_analyze", { method: "POST", body: formData });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "request failed");
+    renderFloodResult(data);
+    setStatus("flood-status", "");
+  } catch (err) {
+    setStatus("flood-status", "Error: " + err.message, true);
+  }
+}
+document.getElementById("flood-submit").addEventListener("click", submitFloodAnalyze);
+
 // -- Smart Query parsing (free-text -> fills in the fields above) -----------
 //
 // Parsing only ever fills in rw-bounds/rw-variable below and previews the

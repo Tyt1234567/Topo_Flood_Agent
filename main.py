@@ -1,10 +1,10 @@
 """
 CLI entry point for the GeoAI Agent Spatial Reasoning Pipeline.
 
-Prerequisites (see local_llm_example.py):
-1. Ollama installed and running (http://localhost:11434).
-2. Model pulled: ollama pull qwen2.5:7b-instruct
-3. pip install -r requirements.txt
+Prerequisites:
+1. pip install -r requirements.txt
+2. GEMINI_API_KEY environment variable set to a free-tier Gemini API key
+   (https://aistudio.google.com/apikey).
 
 Usage:
     python main.py
