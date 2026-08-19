@@ -1,12 +1,12 @@
 "use strict";
 
+// -- shared small helpers ----------------------------------------------------
+
 function setStatus(id, message, isError) {
   const el = document.getElementById(id);
   el.textContent = message || "";
   el.classList.toggle("error", !!isError);
 }
-
-// -- modals -----------------------------------------------------------------
 
 function openModal(id) {
   document.getElementById(id).hidden = false;
@@ -18,523 +18,528 @@ function closeModal(id) {
 
 document.querySelectorAll(".modal-overlay").forEach((overlay) => {
   overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) overlay.hidden = true; // click outside the modal card closes it
+    if (e.target === overlay) overlay.hidden = true;
   });
 });
-document.addEventListener("keydown", (e) => {
-  if (e.key !== "Escape") return;
-  document.querySelectorAll(".modal-overlay").forEach((overlay) => { overlay.hidden = true; });
-});
 
-// -- shared GeoJSON -> Leaflet layer helpers -------------------------------
+// -- persistent right-column map ---------------------------------------------
+//
+// One Leaflet map instance lives for the whole page session (ArcGIS/QGIS-
+// style: the map is always there, not something that appears only once a
+// report finishes) -- populateMap() clears and rebuilds its data layers each
+// time a new "done" event arrives, rather than creating a new map per run.
 
-function fieldLayer(geojson) {
-  return L.geoJSON(geojson, {
-    style: (feature) => ({
-      fillColor: feature.properties.color,
-      color: feature.properties.color,
-      weight: 0,
-      fillOpacity: 0.65,
-    }),
-  });
-}
+let persistentMap = null;
+let mapLayers = { heat: null, allMinima: null, boundary: null, catchment: null, reportFocus: null };
+let mapLayerControl = null;
+let mapLegendControl = null;
+let mapSliderControl = null;
+let currentMapData = null;
+let persistenceThreshold = 0;
 
-function pointsLayer(geojson, labelPrefix) {
-  return L.geoJSON(geojson, {
-    pointToLayer: (feature, latlng) =>
-      L.circleMarker(latlng, {
-        radius: 6, color: "#222", weight: 1,
-        fillColor: feature.properties.color, fillOpacity: 0.9,
-      }),
-    onEachFeature: (feature, layer) => {
-      const p = feature.properties;
-      const persistence = p.persistence === null ? "infinite (global extremum)" : p.persistence.toFixed(3);
-      layer.bindPopup(
-        `<b>${labelPrefix} - ${p.kind}</b><br>value: ${p.value.toFixed(3)}<br>persistence: ${persistence}`
-      );
-    },
-  });
-}
-
-// -- Real-World Data ---------------------------------------------------------
-
-let realworldMap;
-let realworldTileLayer;
-let realworldLayerControl;
-const realworldOverlays = {};
-let sqPreviewRect = null; // outline of the bounding box shown right after parsing, before raw data loads
-let rwDatasetId = null; // server-cached raw dataset from the last load; reused by Analyze so data isn't fetched twice
-let rwElevationSource = "auto"; // "auto" tries USGS 3DEP first for elevation, falling back to Open-Meteo automatically
-
-function initRealworldMap() {
-  realworldMap = L.map("realworld-map");
-  realworldMap.setView([40.0, -105.3], 11);
-  realworldTileLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+function initPersistentMap() {
+  persistentMap = L.map("persistent-map").setView([39.5, -98.35], 4);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: "&copy; OpenStreetMap contributors",
     maxZoom: 19,
-  }).addTo(realworldMap);
+  }).addTo(persistentMap);
 }
 
-function clearRealworldOverlays() {
-  Object.values(realworldOverlays).forEach((layer) => realworldMap.removeLayer(layer));
-  for (const key in realworldOverlays) delete realworldOverlays[key];
-  if (realworldLayerControl) realworldMap.removeControl(realworldLayerControl);
-  realworldLayerControl = null;
+// viridis-ish ramp for the all-minima drainage-demand layer -- matches the
+// one embedded in the downloadable report (geoai_agent/report.py's
+// _webmap_fragment) so the two views read the same way.
+function runoffColor(t) {
+  const stops = [[0, [68, 1, 84]], [0.25, [59, 82, 139]], [0.5, [33, 145, 140]], [0.75, [94, 201, 98]], [1, [253, 231, 37]]];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const a = stops[i], b = stops[i + 1];
+    if (t >= a[0] && t <= b[0]) {
+      const f = b[0] === a[0] ? 0 : (t - a[0]) / (b[0] - a[0]);
+      const r = Math.round(a[1][0] + f * (b[1][0] - a[1][0]));
+      const g = Math.round(a[1][1] + f * (b[1][1] - a[1][1]));
+      const bl = Math.round(a[1][2] + f * (b[1][2] - a[1][2]));
+      return `rgb(${r},${g},${bl})`;
+    }
+  }
+  return "rgb(253,231,37)";
 }
 
-// Switches the map to the resolved location as soon as it's known (right
-// after Parse, before the user even clicks "Fetch live & analyze"), so
-// they can see where the analysis will run and back out if it's wrong.
-function previewBounds(bounds, popupText) {
-  const [latMin, latMax, lonMin, lonMax] = bounds;
+function maxPersistence(featureCollection) {
+  let m = 0;
+  ((featureCollection && featureCollection.features) || []).forEach((f) => {
+    const p = f.properties.persistence_m;
+    if (p !== null && p !== undefined) m = Math.max(m, p);
+  });
+  return m;
+}
+
+// Real-world persistence values are heavily right-skewed (a handful of deep
+// basins, a long tail of shallow noise) -- a slider spanning [0, max]
+// linearly spends nearly all of its travel on a range where almost nothing
+// is between the smallest values and the few large ones, so most of the
+// track does nothing. Mapping slider position to a PERCENTILE of the
+// actual persistence values instead (nearest-rank) means every step of the
+// slider always changes the shown set by roughly the same number of
+// points, regardless of how skewed the distribution is.
+function sortedPersistenceValues(featureCollection) {
+  return ((featureCollection && featureCollection.features) || [])
+    .map((f) => f.properties.persistence_m)
+    .filter((p) => p !== null && p !== undefined)
+    .sort((a, b) => a - b);
+}
+function percentileToThreshold(sorted, pct) {
+  if (!sorted.length) return 0;
+  const idx = Math.min(sorted.length - 1, Math.floor((pct / 100) * sorted.length));
+  return sorted[idx];
+}
+
+// Marker size = persistence (deeper/more-persistent depressions draw bigger
+// dots) -- a global sink (persistence_m === null, no deeper point to compare
+// against) is treated as maximally persistent, same convention as the static
+// map in report.py.
+function persistenceRadius(persistenceM, maxP, minR, maxR) {
+  if (persistenceM === null || persistenceM === undefined) return maxR;
+  if (maxP <= 0) return minR;
+  const frac = Math.max(0, Math.min(1, persistenceM / maxP));
+  return minR + frac * (maxR - minR);
+}
+
+function clearMapLayers() {
+  Object.values(mapLayers).forEach((layer) => { if (layer) persistentMap.removeLayer(layer); });
+  mapLayers = { heat: null, allMinima: null, boundary: null, catchment: null, reportFocus: null };
+  if (mapLayerControl) { persistentMap.removeControl(mapLayerControl); mapLayerControl = null; }
+  if (mapLegendControl) { persistentMap.removeControl(mapLegendControl); mapLegendControl = null; }
+  if (mapSliderControl) { persistentMap.removeControl(mapSliderControl); mapSliderControl = null; }
+}
+
+// Called from inside the report iframe (report.py renders each hotspot/
+// local-minimum mention as a clickable element that invokes this via
+// `parent.focusMapPoint(...)`) -- the iframe is same-origin (srcdoc), so it
+// can reach this directly rather than needing postMessage. Flies the
+// persistent map to the point the report is describing and, when the
+// clicked mention has a catchment_id, also highlights that basin's actual
+// contributing area (same visual as clicking the dot on the map itself).
+function focusMapPoint(lat, lon, catchmentId) {
+  if (!persistentMap) return;
+  if (mapLayers.reportFocus) { persistentMap.removeLayer(mapLayers.reportFocus); mapLayers.reportFocus = null; }
+  mapLayers.reportFocus = L.circleMarker([lat, lon], {
+    radius: 12, weight: 3, color: "#e63946", fillColor: "#e63946", fillOpacity: 0.15,
+  }).addTo(persistentMap);
+  persistentMap.flyTo([lat, lon], Math.max(persistentMap.getZoom(), 15));
+  if (catchmentId !== null && catchmentId !== undefined) highlightCatchment(catchmentId);
+}
+window.focusMapPoint = focusMapPoint;
+
+// Highlights one local minimum's contributing area: every terrain cell
+// whose catchment_id (see report.py's elevation_hillshade_geojson) matches
+// the clicked feature's own catchment_id -- i.e. TTK's descending-manifold
+// segmentation for that basin, not an approximation drawn after the fact.
+function highlightCatchment(catchmentId) {
+  if (mapLayers.catchment) { persistentMap.removeLayer(mapLayers.catchment); mapLayers.catchment = null; }
+  document.getElementById("catchment-clear-row").hidden = catchmentId === null || catchmentId === undefined;
+  if (catchmentId === null || catchmentId === undefined || !currentMapData) return;
+  const cells = currentMapData.field_geojson.features.filter((f) => f.properties.catchment_id === catchmentId);
+  mapLayers.catchment = L.geoJSON({ type: "FeatureCollection", features: cells }, {
+    style: { fillColor: "#2b6cb0", color: "#12335c", weight: 1, fillOpacity: 0.55 },
+    interactive: false,
+  }).addTo(persistentMap);
+  mapLayers.catchment.bringToFront();
+}
+
+function rebuildAllMinimaLayer() {
+  if (!currentMapData || !currentMapData.all_minima_geojson) return;
+  if (mapLayers.allMinima) mapLayers.allMinima.clearLayers();
+  const shown = currentMapData.all_minima_geojson.features.filter(
+    (f) => (f.properties.persistence_m === null || f.properties.persistence_m === undefined) || f.properties.persistence_m >= persistenceThreshold
+  );
+  mapLayers.allMinima.addData({ type: "FeatureCollection", features: shown });
+  const countEl = document.getElementById("minima-count-label");
+  if (countEl) countEl.textContent = `Showing ${shown.length} of ${currentMapData.all_minima_geojson.features.length}`;
+}
+
+function populateMap(mapData) {
+  clearMapLayers();
+  currentMapData = mapData;
+  persistenceThreshold = 0;
+  document.getElementById("map-empty-state").hidden = true;
+
+  const [latMin, latMax, lonMin, lonMax] = mapData.bounds;
   const leafletBounds = [[latMin, lonMin], [latMax, lonMax]];
-  if (sqPreviewRect) realworldMap.removeLayer(sqPreviewRect);
-  sqPreviewRect = L.rectangle(leafletBounds, {
-    color: "#2b6cb0", weight: 2, fillOpacity: 0.08, dashArray: "6",
-  }).addTo(realworldMap);
-  if (popupText) sqPreviewRect.bindPopup(popupText).openPopup();
-  realworldMap.fitBounds(leafletBounds, { maxZoom: 13 });
+
+  mapLayers.heat = L.geoJSON(mapData.field_geojson, {
+    style: (f) => ({ fillColor: f.properties.color, color: f.properties.color, weight: 0, fillOpacity: 0.8 }),
+  }).addTo(persistentMap);
+
+  const overlays = { "Elevation (terrain)": mapLayers.heat };
+
+  if (mapData.boundary_geojson) {
+    mapLayers.boundary = L.geoJSON(mapData.boundary_geojson, {
+      style: { fill: false, color: "#a8492c", weight: 2.5 },
+    }).addTo(persistentMap);
+    overlays["Boundary"] = mapLayers.boundary;
+  }
+
+  if (mapData.all_minima_geojson) {
+    const allMinimaMaxP = maxPersistence(mapData.all_minima_geojson);
+    mapLayers.allMinima = L.geoJSON(null, {
+      pointToLayer: (f, latlng) => {
+        const p = f.properties;
+        const r = persistenceRadius(p.persistence_m, allMinimaMaxP, 4, 16);
+        return L.circleMarker(latlng, {
+          radius: r,
+          weight: p.within_boundary ? 1.5 : 0.5,
+          color: p.within_boundary ? "#222" : "#8894",
+          fillColor: runoffColor(p.t),
+          fillOpacity: 0.85,
+        });
+      },
+      onEachFeature: (f, layer) => {
+        const p = f.properties;
+        const boundaryNote = p.within_boundary === null || p.within_boundary === undefined
+          ? ""
+          : `<br>${p.within_boundary ? "inside" : "outside"} the resolved boundary`;
+        layer.bindPopup(
+          `<b>Local minimum #${p.rank}</b><br>drainage demand: ${p.estimated_peak_runoff_m3s.toFixed(2)} m&sup3;/s` +
+          `<br>contributing area: ${p.contributing_area_km2.toFixed(3)} km&sup2;` +
+          `<br>persistence: ${p.persistence_m === null ? "global sink" : p.persistence_m.toFixed(2) + " m"}${boundaryNote}` +
+          `<br><em>click the dot to highlight its catchment</em>`
+        );
+        layer.on("click", () => highlightCatchment(p.catchment_id));
+      },
+    }).addTo(persistentMap);
+    overlays["All local minima (drainage demand)"] = mapLayers.allMinima;
+  }
+
+  mapLayerControl = L.control.layers(null, overlays, { collapsed: false }).addTo(persistentMap);
+
+  // -- legend: elevation gradient + marker encoding + catchment hint -----
+  mapLegendControl = L.control({ position: "bottomleft" });
+  mapLegendControl.onAdd = () => {
+    const div = L.DomUtil.create("div", "webmap-legend");
+    let gradientHtml = "";
+    if (mapData.elevation_legend && mapData.elevation_legend.length) {
+      const stops = mapData.elevation_legend;
+      const gradientCss = stops.map((s, i) => `${s.color} ${(i / (stops.length - 1)) * 100}%`).join(", ");
+      gradientHtml =
+        `<div><strong>Elevation</strong></div>` +
+        `<div style="width:160px;height:10px;border-radius:2px;margin:3px 0;background:linear-gradient(90deg, ${gradientCss});"></div>` +
+        `<div style="display:flex;justify-content:space-between;font-size:10.5px;">` +
+        `<span>${stops[0].value.toFixed(0)} m</span><span>${stops[stops.length - 1].value.toFixed(0)} m</span></div>`;
+    }
+    div.innerHTML =
+      gradientHtml +
+      `<div style="margin-top:6px;"><strong>Dot size</strong> = persistence (bigger = deeper basin)</div>` +
+      (mapData.all_minima_geojson ? `<div><strong>Dot fill</strong> = drainage demand</div>` : "") +
+      `<div>Click a dot -- or a point mentioned in the report -- to highlight its catchment area</div>` +
+      `<div id="catchment-clear-row" hidden><a href="#" id="catchment-clear-link">Clear catchment highlight</a></div>`;
+    return div;
+  };
+  mapLegendControl.addTo(persistentMap);
+  L.DomEvent.disableClickPropagation(mapLegendControl.getContainer());
+  document.getElementById("catchment-clear-link").addEventListener("click", (e) => {
+    e.preventDefault();
+    highlightCatchment(null);
+  });
+
+  // -- persistence-threshold slider: filters the all-minima layer client- --
+  // side (no re-fetch/re-analyze -- every raw minimum's persistence_m is
+  // already in mapData, this just changes which of them are drawn).
+  if (mapData.all_minima_geojson && mapData.all_minima_geojson.features.length) {
+    const sortedP = sortedPersistenceValues(mapData.all_minima_geojson);
+    mapSliderControl = L.control({ position: "topleft" });
+    mapSliderControl.onAdd = () => {
+      const div = L.DomUtil.create("div", "webmap-legend webmap-slider");
+      div.innerHTML =
+        `<div><strong>Persistence threshold</strong>: <span id="threshold-value">0.0</span> m ` +
+        `(<span id="threshold-percentile">0</span>th pct.)</div>` +
+        `<input type="range" id="persistence-slider" min="0" max="100" step="1" value="0" style="width:180px;">` +
+        `<div id="minima-count-label" style="font-size:10.5px;color:inherit;"></div>`;
+      return div;
+    };
+    mapSliderControl.addTo(persistentMap);
+    const sliderEl = document.getElementById("persistence-slider");
+    L.DomEvent.disableClickPropagation(mapSliderControl.getContainer());
+    sliderEl.addEventListener("input", () => {
+      const pct = parseFloat(sliderEl.value);
+      persistenceThreshold = percentileToThreshold(sortedP, pct);
+      document.getElementById("threshold-value").textContent = persistenceThreshold.toFixed(1);
+      document.getElementById("threshold-percentile").textContent = pct.toFixed(0);
+      rebuildAllMinimaLayer();
+    });
+    rebuildAllMinimaLayer();
+  }
+
+  persistentMap.fitBounds(leafletBounds);
 }
 
-document.getElementById("rw-advanced-open").addEventListener("click", () => openModal("rw-advanced-modal"));
-document.getElementById("rw-advanced-close").addEventListener("click", () => closeModal("rw-advanced-modal"));
+// -- terminal panel: a collapsible slide-in log, not a full-page view ------
 
-let customLayerCount = 0;
-document.getElementById("rw-add-layer").addEventListener("click", () => {
-  customLayerCount += 1;
+function setTerminalOpen(open) {
+  document.getElementById("terminal-panel").classList.toggle("open", open);
+}
+
+document.getElementById("terminal-toggle").addEventListener("click", () => {
+  const panel = document.getElementById("terminal-panel");
+  setTerminalOpen(!panel.classList.contains("open"));
+});
+
+function addProgressStep(step) {
+  const log = document.getElementById("progress-log");
+  const prevLive = log.querySelector(".step-dot.live");
+  if (prevLive) prevLive.classList.remove("live");
+
   const row = document.createElement("div");
-  row.className = "custom-layer-row";
+  row.className = "pipeline-step";
+  const detailText = step.detail ? JSON.stringify(step.detail, null, 2) : "";
   row.innerHTML = `
-    <input type="text" placeholder="layer name" class="rw-layer-name">
-    <input type="file" accept=".csv,.zip,.shp" class="rw-layer-file">
-    <input type="text" placeholder="what does this measure? (optional, helps the recommendation)" class="rw-layer-description">
-    <button type="button" class="secondary rw-remove-layer">x</button>
-  `;
-  row.querySelector(".rw-remove-layer").addEventListener("click", () => row.remove());
-  document.getElementById("rw-custom-layers").appendChild(row);
-});
-
-function buildRealworldFormData() {
-  const formData = new FormData();
-  formData.append("bounds", document.getElementById("rw-bounds").value.trim());
-  formData.append("resolution_meters", document.getElementById("rw-resolution-meters").value);
-  formData.append("primary_variable", document.getElementById("rw-variable").value);
-  formData.append("use_sample_layer", document.getElementById("rw-sample").checked ? "true" : "false");
-  formData.append("elevation_source", rwElevationSource);
-
-  document.querySelectorAll(".custom-layer-row").forEach((row) => {
-    const name = row.querySelector(".rw-layer-name").value.trim();
-    const file = row.querySelector(".rw-layer-file").files[0];
-    const description = row.querySelector(".rw-layer-description").value.trim();
-    if (name && file) {
-      formData.append("layer_name", name);
-      formData.append(`layer_file::${name}`, file);
-      if (description) formData.append(`layer_description::${name}`, description);
-    }
-  });
-  return formData;
+    <div class="pipeline-step-summary"><span class="step-dot live"></span>${step.label}</div>
+    ${detailText ? `<pre>${detailText}</pre>` : ""}`;
+  log.appendChild(row);
+  row.scrollIntoView({ behavior: "smooth", block: "end" });
 }
 
-// Fetches just the raw scalar field(s) -- no critical-point analysis, no
-// recommendation -- as soon as a location is confirmed, rather than only
-// as part of the final Analyze step. Renders the real heatmap on the map
-// immediately and caches the dataset server-side (rwDatasetId) so the
-// later Analyze call can reuse it instead of fetching all over again.
-async function loadRawDataPreview() {
-  const formData = buildRealworldFormData();
-  const variable = document.getElementById("rw-variable").value;
-  setStatus("rw-status", (variable === "elevation" && rwElevationSource !== "open_meteo")
-    ? "Trying USGS 3DEP first (one request per point -- this can take up to a minute or two)..."
-    : "Loading raw data for the confirmed location...");
-  try {
-    const res = await fetch("/api/realworld/load_data", { method: "POST", body: formData });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "request failed");
-    rwDatasetId = data.dataset_id;
-    if (data.elevation_source) rwElevationSource = data.elevation_source;
-
-    realworldMap.fitBounds(data.bounds);
-    clearRealworldOverlays();
-    if (sqPreviewRect) {
-      realworldMap.removeLayer(sqPreviewRect);
-      sqPreviewRect = null;
-    }
-    let first = true;
-    for (const [name, layer] of Object.entries(data.layers)) {
-      const field = fieldLayer(layer.field);
-      realworldOverlays[name + " (raw field)"] = field;
-      if (first) { field.addTo(realworldMap); first = false; }
-    }
-    realworldLayerControl = L.control.layers(null, realworldOverlays, { collapsed: false }).addTo(realworldMap);
-    showAchievedResolution(data);
-    setStatus("rw-status", data.elevation_source_fallback_note ||
-      "Raw data loaded -- click \"Fetch & Analyze\" to find critical points.");
-  } catch (err) {
-    setStatus("rw-status", "Error loading raw data: " + err.message, true);
-  }
+function finalizeProgressDots() {
+  const lastDot = document.querySelector("#progress-log .step-dot.live");
+  if (lastDot) lastDot.classList.remove("live");
 }
 
-// Any manual edit invalidates the cached raw dataset -- it no longer
-// matches what's in the fields, so Analyze must fetch fresh instead of
-// reusing stale data. It also resets the elevation source back to the
-// default: source selection came from analyzing the query's own wording,
-// which no longer applies once the user is editing fields by hand. Only
-// fires on genuine user edits: Smart Query sets these fields' .value
-// programmatically, which does not dispatch input events, so the
-// auto-load in renderSmartQueryClarify is unaffected.
-function invalidateRwDataset() {
-  rwDatasetId = null;
-  rwElevationSource = "auto";
-  document.getElementById("rw-achieved-resolution").textContent = "";
-}
-
-// The estimate above (updateGroundResolutionHint) is only ever a PRE-fetch
-// target computed from the input fields -- it has no idea whether the live
-// fetch actually hit that target or fell back to a much smaller grid (e.g.
-// Open-Meteo failing and USGS's tighter point-count cap kicking in). Without
-// this, the Advanced options panel keeps showing the original target (e.g.
-// "~80x80 grid, 6400 points") even after a fetch that actually delivered
-// far fewer points, which reads as a bug rather than an honest source
-// fallback. Called after both load_data and analyze, since either can be
-// the first live response for a given request.
-function showAchievedResolution(data) {
-  const el = document.getElementById("rw-achieved-resolution");
-  const variable = document.getElementById("rw-variable").value;
-  const layer = data.layers && data.layers[variable];
-  const shape = layer && (layer.summary ? layer.summary.shape : layer.shape);
-  if (!shape) {
-    el.textContent = "";
-    return;
-  }
-  const [ny, nx] = shape;
-  el.innerHTML = `<b>Actually delivered:</b> ${nx}x${ny} grid (${nx * ny} points)` +
-    (data.elevation_source_fallback_note ? " -- smaller than requested, see the note below." : ".");
-}
-["rw-bounds", "rw-variable", "rw-resolution-meters"].forEach((id) => {
-  document.getElementById(id).addEventListener("input", invalidateRwDataset);
-  document.getElementById(id).addEventListener("change", invalidateRwDataset);
-});
-document.getElementById("rw-add-layer").addEventListener("click", invalidateRwDataset);
-document.getElementById("rw-sample").addEventListener("change", invalidateRwDataset);
-
-async function submitRealworldAnalyze(feedback) {
-  const formData = buildRealworldFormData();
-  const recommend = document.getElementById("rw-recommend").checked;
-  formData.append("recommend", recommend ? "true" : "false");
-  if (feedback) formData.append("feedback", feedback);
-  if (rwDatasetId) formData.append("dataset_id", rwDatasetId);
-
-  setStatus("rw-status", feedback
-    ? "Re-running with your feedback..."
-    : rwDatasetId
-      ? "Running Morse analysis on the already-loaded data..."
-      : "Fetching real-world data and running Morse analysis...");
-  document.getElementById("rw-result").hidden = true;
-  try {
-    const res = await fetch("/api/realworld/analyze", { method: "POST", body: formData });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "request failed");
-    renderRealworldResult(data);
-    setStatus("rw-status", "");
-  } catch (err) {
-    setStatus("rw-status", "Error: " + err.message, true);
-  }
-}
-
-// Mirrors resolution_for_target_spacing / ground_spacing_meters in
-// geoai_agent/real_data.py -- shows the grid point count and actually
-// achievable per-axis spacing a requested meters-based pixel size resolves
-// to, including when it gets capped, before the request is even sent. Each
-// axis (longitude/x, latitude/y) is sized independently from the box's own
-// physical length on that axis, so a non-square box gets a non-square
-// point count instead of both axes being forced to share one number.
-const RW_MIN_GRID_RESOLUTION = 6;
-const RW_MAX_GRID_RESOLUTION = 80;
-const RW_MAX_USGS_GRID_RESOLUTION = 10;
-
-function updateGroundResolutionHint() {
-  const el = document.getElementById("rw-ground-resolution");
-  const parts = document.getElementById("rw-bounds").value.split(",").map(Number);
-  const meters = Number(document.getElementById("rw-resolution-meters").value);
-  if (parts.length !== 4 || parts.some(Number.isNaN) || !meters || meters <= 0) {
-    el.textContent = "~ grid points";
-    return;
-  }
-  const [latMin, latMax, lonMin, lonMax] = parts;
-  const midLatRad = ((latMin + latMax) / 2) * (Math.PI / 180);
-  const metersPerDegLat = 111320;
-  const metersPerDegLon = 111320 * Math.cos(midLatRad);
-  const lonSpanM = Math.abs(lonMax - lonMin) * metersPerDegLon;
-  const latSpanM = Math.abs(latMax - latMin) * metersPerDegLat;
-
-  const axisPoints = (spanM) => Math.max(
-    RW_MIN_GRID_RESOLUTION, Math.min(Math.ceil(spanM / meters) + 1, RW_MAX_GRID_RESOLUTION)
-  );
-  const nx = axisPoints(lonSpanM);
-  const ny = axisPoints(latSpanM);
-  const cappedByMax = nx === RW_MAX_GRID_RESOLUTION || ny === RW_MAX_GRID_RESOLUTION;
-  const achievedLon = lonSpanM / (nx - 1);
-  const achievedLat = latSpanM / (ny - 1);
-
-  let note = "";
-  if (cappedByMax) note = " (capped for practicality)";
-  else if (nx > RW_MAX_USGS_GRID_RESOLUTION || ny > RW_MAX_USGS_GRID_RESOLUTION) {
-    note = ` -- if USGS is used for elevation, it caps lower (${RW_MAX_USGS_GRID_RESOLUTION}x${RW_MAX_USGS_GRID_RESOLUTION})`;
-  }
-  el.textContent = `~${nx}x${ny} grid (${nx * ny} points, ` +
-    `~${Math.round(achievedLon)}m x ~${Math.round(achievedLat)}m between samples)${note}`;
-}
-document.getElementById("rw-bounds").addEventListener("input", updateGroundResolutionHint);
-document.getElementById("rw-resolution-meters").addEventListener("input", updateGroundResolutionHint);
-
-function renderRealworldResult(data) {
-  realworldMap.fitBounds(data.bounds);
-  clearRealworldOverlays();
-  if (sqPreviewRect) {
-    realworldMap.removeLayer(sqPreviewRect);
-    sqPreviewRect = null;
-  }
-  showAchievedResolution(data);
-
-  const summaryContainer = document.getElementById("rw-layer-summaries");
-  summaryContainer.innerHTML = "";
-
-  if (data.elevation_source) {
-    const sourceNote = document.createElement("p");
-    sourceNote.className = "hint";
-    sourceNote.textContent = `Elevation data source actually used: ${data.elevation_source}`;
-    summaryContainer.appendChild(sourceNote);
-  }
-  if (data.elevation_source_fallback_note) {
-    const fallbackNote = document.createElement("p");
-    fallbackNote.className = "hint warning-note";
-    fallbackNote.textContent = data.elevation_source_fallback_note;
-    summaryContainer.appendChild(fallbackNote);
-  }
-
-  let first = true;
-  for (const [name, layer] of Object.entries(data.layers)) {
-    const field = fieldLayer(layer.field);
-    const points = pointsLayer(layer.points, name);
-    realworldOverlays[name + " (field)"] = field;
-    realworldOverlays[name + " (critical points)"] = points;
-    if (first) {
-      field.addTo(realworldMap);
-      points.addTo(realworldMap);
-      first = false;
-    }
-
-    const s = layer.summary;
-    const euler = s.euler_characteristic;
-    const [ny, nx] = s.shape;
-    const div = document.createElement("div");
-    div.className = "layer-summary";
-    div.innerHTML = `<b>${name}</b> (${nx}x${ny} grid, ${nx * ny} points)<br>
-      range: [${s.value_range[0].toFixed(2)}, ${s.value_range[1].toFixed(2)}]
-      &nbsp;|&nbsp; significant pit basins: ${s.num_significant_basins}
-      &nbsp;|&nbsp; significant peak basins: ${s.num_significant_peak_basins}
-      &nbsp;|&nbsp; threshold: ${s.persistence_threshold.toFixed(3)}
-      <br>domain Euler characteristic: ${euler.domain_euler_characteristic} (disk, expected 1)`;
-    summaryContainer.appendChild(div);
-  }
-
-  realworldLayerControl = L.control.layers(null, realworldOverlays, { collapsed: false }).addTo(realworldMap);
-
-  document.getElementById("rw-result").hidden = false;
-  document.getElementById("rw-recommendation").textContent =
-    data.recommendation || "(not requested)";
-  document.getElementById("rw-feedback-box").style.display = data.recommendation ? "" : "none";
-  document.getElementById("rw-feedback").value = "";
-}
-
-document.getElementById("rw-submit").addEventListener("click", () => submitRealworldAnalyze());
-document.getElementById("rw-rerun").addEventListener("click", () => {
-  const feedback = document.getElementById("rw-feedback").value.trim();
-  if (!feedback) {
-    setStatus("rw-status", "Type feedback first, or click Accept.", true);
-    return;
-  }
-  submitRealworldAnalyze(feedback);
-});
-document.getElementById("rw-accept").addEventListener("click", () => {
-  document.getElementById("rw-feedback-box").style.display = "none";
-  setStatus("rw-status", "Recommendation accepted.");
-});
-
-// -- Flood & drainage analysis (HITL rainfall-scenario / weight-preset) -----
+// -- one-box agent flow -------------------------------------------------------
 //
-// Reuses rwDatasetId if a location is already loaded (so this doesn't
-// re-fetch live data); otherwise sends the same bounds/topic fields the
-// main Fetch & Analyze action does, and the backend fetches fresh.
+// place-input -> (exposure-modal: optional file, or skip) -> POST
+// /api/agent/analyze_stream, whose response body is newline-delimited JSON,
+// one {"type": "step"|"error"|"done", ...} object per line, flushed as each
+// pipeline stage finishes server-side. Read with fetch()'s streaming body
+// reader (not EventSource -- EventSource can't POST a file upload for the
+// exposure layer) so the terminal panel fills in live instead of only
+// appearing once the whole multi-stage analysis is done.
 
-function floodHotspotMarkers(geojson) {
-  return L.geoJSON(geojson, {
-    pointToLayer: (feature, latlng) =>
-      L.circleMarker(latlng, {
-        radius: 8, color: "#222", weight: 1,
-        fillColor: feature.properties.color, fillOpacity: 0.85,
-      }),
-    onEachFeature: (feature, layer) => {
-      const p = feature.properties;
-      layer.bindPopup(
-        `<b>Flood hotspot #${p.rank}</b><br>risk score: ${p.risk_score.toFixed(3)}` +
-        `<br>contributing area: ${p.contributing_area_km2.toFixed(3)} km&sup2;` +
-        `<br>estimated peak runoff: ${p.estimated_peak_runoff_m3s.toFixed(2)} m&sup3;/s` +
-        `<br>persistence: ${p.persistence_m === null ? "infinite (deepest sink)" : p.persistence_m.toFixed(2) + "m"}`
-      );
-    },
-  });
-}
+let pendingExposureFile = null;
 
-function renderFloodResult(data) {
-  const container = document.getElementById("flood-hotspot-table");
-  if (!data.hotspots.length) {
-    container.innerHTML = "<p class=\"hint\">No significant basins found -- nothing to rank.</p>";
-  } else {
-    const rows = data.hotspots.map((h) => `
-      <tr>
-        <td>${h.rank}</td>
-        <td>${h.risk_score.toFixed(3)}</td>
-        <td>${h.contributing_area_km2.toFixed(3)}</td>
-        <td>${h.estimated_peak_runoff_m3s.toFixed(2)}</td>
-        <td>${h.persistence_m === null ? "infinite" : h.persistence_m.toFixed(2)}</td>
-      </tr>`).join("");
-    container.innerHTML = `
-      <table class="flood-table">
-        <thead><tr><th>Rank</th><th>Risk score</th><th>Contrib. area (km&sup2;)</th>
-          <th>Peak runoff (m&sup3;/s)</th><th>Persistence (m)</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>`;
-  }
-  if (!data.slope_layer_available || !data.exposure_layer_available) {
-    const missing = [];
-    if (!data.slope_layer_available) missing.push("slope");
-    if (!data.exposure_layer_available) missing.push("exposure");
-    container.innerHTML += `<p class="hint">${missing.join(" and ")} not available for this run -- ` +
-      "those risk factors used a neutral default rather than real data.";
-  }
-
-  if (realworldOverlays["flood hotspots"]) realworldMap.removeLayer(realworldOverlays["flood hotspots"]);
-  const markers = floodHotspotMarkers(data.hotspots_geojson);
-  realworldOverlays["flood hotspots"] = markers;
-  markers.addTo(realworldMap);
-  if (realworldLayerControl) realworldMap.removeControl(realworldLayerControl);
-  realworldLayerControl = L.control.layers(null, realworldOverlays, { collapsed: false }).addTo(realworldMap);
-
-  document.getElementById("flood-result").hidden = false;
-  document.getElementById("flood-recommendation").textContent = data.recommendation || "(not requested)";
-}
-
-async function submitFloodAnalyze() {
-  const formData = buildRealworldFormData();
-  formData.append("rainfall_scenario", document.getElementById("flood-rainfall").value);
-  formData.append("weight_preset", document.getElementById("flood-weights").value);
-  formData.append("recommend", "true");
-  if (rwDatasetId) formData.append("dataset_id", rwDatasetId);
-
-  setStatus("flood-status", "Running Morse analysis and ranking flood hotspots...");
-  document.getElementById("flood-result").hidden = true;
-  try {
-    const res = await fetch("/api/realworld/flood_analyze", { method: "POST", body: formData });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "request failed");
-    renderFloodResult(data);
-    setStatus("flood-status", "");
-  } catch (err) {
-    setStatus("flood-status", "Error: " + err.message, true);
-  }
-}
-document.getElementById("flood-submit").addEventListener("click", submitFloodAnalyze);
-
-// -- Smart Query parsing (free-text -> fills in the fields above) -----------
+// -- report Q&A chat -----------------------------------------------------
 //
-// Parsing only ever fills in rw-bounds/rw-variable below and previews the
-// area on the map -- it never fetches data itself. There is exactly one
-// "Fetch & Analyze" button (submitRealworldAnalyze, above) and exactly one
-// bounds/topic state (the rw-* fields), so there is no way to click a
-// "run" action against a stale or different location than what was just
-// parsed.
+// The LLM as the front-facing agent, not just the backend step that writes
+// the recommendation paragraph once and disappears: qaContext is the
+// compact per-run summary analyze_stream's "done" event includes
+// specifically for this (ranked hotspots, elevation stats, rainfall/
+// weights, the recommendation text -- not the full map_data/report HTML).
+// Stateless like the rest of this app -- chatHistory lives only in this
+// tab and is resent with every question rather than kept server-side.
 
-async function submitSmartQueryParse() {
-  const query = document.getElementById("sq-query").value.trim();
-  if (!query) {
-    setStatus("sq-status", "Describe what to analyze first.", true);
+let qaContext = null;
+let chatHistory = [];
+let lastAnalyzedPlace = null;
+
+// A narrow, deterministic (no LLM call -- every chat turn already costs one
+// against the free-tier daily quota, doubling that per message just to
+// classify intent isn't worth it) detector for "change the resolution and
+// re-run": requires both a resolution-ish keyword and a number+unit near
+// it, so it doesn't misfire on unrelated numbers (rainfall mm/hr, ranks,
+// coordinates) elsewhere in a normal question.
+function parseResolutionRequest(text) {
+  if (!/resolution|分辨率|精度/i.test(text)) return null;
+  const match = text.match(/(\d+(?:\.\d+)?)\s*(米|m|meters?)(?!m)\b/i);
+  if (!match) return null;
+  const value = parseFloat(match[1]);
+  return isFinite(value) && value > 0 ? value : null;
+}
+
+function addChatMessage(role, content, extraClass) {
+  const log = document.getElementById("chat-log");
+  const row = document.createElement("div");
+  row.className = `chat-msg ${role}${extraClass ? " " + extraClass : ""}`;
+  row.textContent = content;
+  log.appendChild(row);
+  row.scrollIntoView({ behavior: "smooth", block: "end" });
+  return row;
+}
+
+async function sendChatMessage() {
+  const input = document.getElementById("chat-input");
+  const question = input.value.trim();
+  if (!question) return;
+  if (!qaContext) {
+    setStatus("chat-status", "Run an analysis first.", true);
     return;
   }
-  setStatus("sq-status", "Parsing bounding box and topic...");
+
+  setStatus("chat-status", "");
+  input.value = "";
+  addChatMessage("user", question);
+
+  const requestedResolution = parseResolutionRequest(question);
+  if (requestedResolution !== null) {
+    addChatMessage("assistant", `Got it -- re-running the analysis for ${lastAnalyzedPlace} at ${requestedResolution}m resolution…`);
+    runAgentAnalysis(lastAnalyzedPlace, pendingExposureFile, requestedResolution, { preserveChat: true });
+    return;
+  }
+
+  document.getElementById("chat-send").disabled = true;
+  const pendingRow = addChatMessage("assistant", "Thinking…", "pending");
 
   const formData = new FormData();
-  formData.append("query", query);
+  formData.append("question", question);
+  formData.append("context", JSON.stringify(qaContext));
+  formData.append("history", JSON.stringify(chatHistory));
 
   try {
-    const res = await fetch("/api/realworld/smart_query", { method: "POST", body: formData });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "request failed");
-    renderSmartQueryClarify(data);
-    setStatus("sq-status", "");
+    const res = await fetch("/api/agent/ask", { method: "POST", body: formData });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+    pendingRow.textContent = data.answer;
+    pendingRow.classList.remove("pending");
+    chatHistory.push({ role: "user", content: question });
+    chatHistory.push({ role: "assistant", content: data.answer });
   } catch (err) {
-    setStatus("sq-status", "Error: " + err.message, true);
+    pendingRow.textContent = "Couldn't get an answer: " + err.message;
+    pendingRow.classList.remove("pending");
+    pendingRow.classList.add("error");
+  } finally {
+    document.getElementById("chat-send").disabled = false;
+    input.focus();
   }
 }
 
-function renderSmartQueryClarify(data) {
-  const [latMin, latMax, lonMin, lonMax] = data.bounds;
-  const place = data.resolved_place;
-  const placeLine = place
-    ? `<br><b>Resolved place:</b> ${place.name}, ${place.admin1 || ""} ${place.country || ""} ` +
-      `(${place.latitude.toFixed(4)}, ${place.longitude.toFixed(4)})`
-    : "";
+document.getElementById("chat-send").addEventListener("click", sendChatMessage);
+document.getElementById("chat-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); sendChatMessage(); }
+});
 
-  previewBounds(
-    data.bounds,
-    place ? `${place.name}${place.admin1 ? ", " + place.admin1 : ""}` : "Bounding box to analyze"
-  );
+function showReport(event, placeLabel, options) {
+  options = options || {};
+  const card = document.getElementById("report-card");
+  card.hidden = false;
+  document.getElementById("report-title").textContent = `Report -- ${placeLabel}`;
+  document.getElementById("report-frame").srcdoc = event.report_body_html;
 
-  document.getElementById("rw-bounds").value =
-    [latMin, latMax, lonMin, lonMax].map((v) => v.toFixed(5)).join(",");
-  document.getElementById("rw-variable").value = data.variable;
-  rwElevationSource = data.elevation_source || "auto";
+  const blob = new Blob([event.report_html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  const link = document.getElementById("report-download");
+  link.href = url;
+  const safeName = placeLabel.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+  link.download = `flood-report-${safeName || "location"}.html`;
 
-  let resolutionLine = "";
-  if (data.requested_resolution_meters) {
-    const requested = data.requested_resolution_meters;
-    const [achievedLon, achievedLat] = data.achieved_resolution_meters;
-    const achievedWorst = Math.max(achievedLon, achievedLat); // the coarser of the two axes
-    document.getElementById("rw-resolution-meters").value = requested;
-    const closeEnough = achievedWorst <= requested * 1.1; // within ~10% counts as "hit the target"
-    const achievedText = Math.round(achievedLon) === Math.round(achievedLat)
-      ? `~${Math.round(achievedWorst)}m`
-      : `~${Math.round(achievedLon)}m x ~${Math.round(achievedLat)}m`;
-    resolutionLine = closeEnough
-      ? `<br><b>Resolution:</b> ${achievedText} between samples, close to the requested ${requested}m.`
-      : `<br><b>Resolution:</b> this bounding box is too large to actually reach ${requested}m at a ` +
-        `practical grid size; the closest achievable is ${achievedText}. Shrink the bounding ` +
-        "box for finer resolution.";
+  qaContext = event.qa_context || null;
+  // A chat-triggered re-run (e.g. "redo this at 30m resolution") keeps the
+  // conversation visible -- the request that caused the re-run is itself
+  // part of that conversation, wiping it the moment the new report lands
+  // would erase the question right as it gets answered.
+  if (!options.preserveChat) {
+    chatHistory = [];
+    document.getElementById("chat-log").innerHTML = "";
+    setStatus("chat-status", "");
   }
 
-  const sourceLine = data.source_note ? `<br><b>Data source:</b> ${data.source_note}` : "";
-
-  document.getElementById("sq-clarify-summary").innerHTML =
-    `<b>Bounding box:</b> ${latMin.toFixed(3)}, ${latMax.toFixed(3)}, ${lonMin.toFixed(3)}, ${lonMax.toFixed(3)}` +
-    placeLine +
-    `<br><b>Topic:</b> ${data.variable}` +
-    resolutionLine +
-    sourceLine;
-  updateGroundResolutionHint();
-  openModal("sq-modal"); // confirm before loading anything -- especially important for the slow USGS path
+  if (event.map_data) populateMap(event.map_data);
 }
 
-document.getElementById("sq-parse").addEventListener("click", submitSmartQueryParse);
-document.getElementById("sq-modal-confirm").addEventListener("click", () => {
-  closeModal("sq-modal");
-  loadRawDataPreview(); // fetch the raw field as soon as the location is confirmed, not at the end of the pipeline
+async function runAgentAnalysis(place, exposureFile, resolutionMeters, options) {
+  options = options || {};
+  lastAnalyzedPlace = place;
+  document.getElementById("terminal-panel").hidden = false;
+  setTerminalOpen(true);
+  document.getElementById("terminal-toggle-label").textContent = `Analyzing ${place}…`;
+  document.getElementById("terminal-dot").className = "step-dot live";
+  document.getElementById("progress-place").textContent = place;
+  document.getElementById("progress-log").innerHTML = "";
+  document.getElementById("progress-error").hidden = true;
+  document.getElementById("progress-retry").hidden = true;
+  document.getElementById("report-card").hidden = true;
+  setStatus("intro-status", "");
+
+  const formData = new FormData();
+  formData.append("place", place);
+  if (exposureFile) formData.append("exposure_file", exposureFile);
+  if (resolutionMeters) formData.append("resolution_meters", String(resolutionMeters));
+
+  try {
+    const res = await fetch("/api/agent/analyze_stream", { method: "POST", body: formData });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `request failed (${res.status})`);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // last element may be a partial line -- keep it for the next chunk
+
+      for (const rawLine of lines) {
+        const trimmed = rawLine.trim();
+        if (!trimmed) continue;
+        const event = JSON.parse(trimmed);
+
+        if (event.type === "step") {
+          addProgressStep(event);
+        } else if (event.type === "error") {
+          finalizeProgressDots();
+          const errEl = document.getElementById("progress-error");
+          errEl.textContent = event.message;
+          errEl.hidden = false;
+          document.getElementById("progress-retry").hidden = false;
+          document.getElementById("terminal-toggle-label").textContent = "Analysis failed";
+          document.getElementById("terminal-dot").className = "step-dot error";
+          if (options.preserveChat) addChatMessage("assistant", "The re-run failed: " + event.message, "error");
+          return;
+        } else if (event.type === "done") {
+          finalizeProgressDots();
+          document.getElementById("terminal-toggle-label").textContent = `Done in ${event.total_elapsed_seconds}s -- ${place}`;
+          document.getElementById("terminal-dot").className = "step-dot";
+          setTerminalOpen(false);
+          showReport(event, event.place_label || place, options);
+          if (options.preserveChat) addChatMessage("assistant", `Done (${event.total_elapsed_seconds}s) -- map and report above are now from the new run. Ask away.`);
+          return;
+        }
+      }
+    }
+  } catch (err) {
+    finalizeProgressDots();
+    const errEl = document.getElementById("progress-error");
+    errEl.textContent = "Error: " + err.message;
+    errEl.hidden = false;
+    document.getElementById("progress-retry").hidden = false;
+    document.getElementById("terminal-toggle-label").textContent = "Analysis failed";
+    document.getElementById("terminal-dot").className = "step-dot error";
+    if (options.preserveChat) addChatMessage("assistant", "The re-run failed: " + err.message, "error");
+  }
+}
+
+document.getElementById("place-submit").addEventListener("click", () => {
+  const place = document.getElementById("place-input").value.trim();
+  if (!place) {
+    setStatus("intro-status", "Type a place first.", true);
+    return;
+  }
+  setStatus("intro-status", "");
+  document.getElementById("exposure-file").value = "";
+  pendingExposureFile = null;
+  openModal("exposure-modal");
 });
-document.getElementById("sq-modal-edit").addEventListener("click", () => {
-  closeModal("sq-modal");
-  setStatus("sq-status", "Edit the fields below, then click \"Fetch & Analyze\" when ready.");
+document.getElementById("place-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); document.getElementById("place-submit").click(); }
 });
 
-// -- init ---------------------------------------------------------------
+document.getElementById("exposure-continue").addEventListener("click", () => {
+  pendingExposureFile = document.getElementById("exposure-file").files[0] || null;
+  closeModal("exposure-modal");
+  runAgentAnalysis(document.getElementById("place-input").value.trim(), pendingExposureFile);
+});
+document.getElementById("exposure-skip").addEventListener("click", () => {
+  pendingExposureFile = null;
+  closeModal("exposure-modal");
+  runAgentAnalysis(document.getElementById("place-input").value.trim(), null);
+});
 
-initRealworldMap();
-updateGroundResolutionHint();
+function resetToIntro() {
+  document.getElementById("report-card").hidden = true;
+  document.getElementById("place-input").value = "";
+  document.getElementById("place-input").focus();
+  setStatus("intro-status", "");
+}
+document.getElementById("progress-retry").addEventListener("click", resetToIntro);
+document.getElementById("report-new").addEventListener("click", resetToIntro);
+
+initPersistentMap();

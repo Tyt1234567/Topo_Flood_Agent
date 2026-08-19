@@ -29,6 +29,16 @@ environment with TTK's VTK-based Python bindings installed (see the
 `TTK_PYTHON` / `TTK_BIN_DIR` env vars in that file if your TTK install
 isn't at the default `D:\anaconda3\envs\tda_env` / `D:\TTK\bin` paths).
 
+The default elevation source within the continental US is the actual USGS
+3DEP DEM raster, streamed straight from its source GeoTIFF and clipped to
+the requested area via GDAL (no point-count cap, unlike the older
+point-by-point USGS service still used as a fallback):
+`geoai_agent/dem_cog_source.py` shells out to QGIS's bundled Python (see
+the `QGIS_PYTHON` env var in that file if your QGIS install isn't at the
+default `D:\QGIS\bin\python-qgis.bat`). Without a QGIS install, elevation
+fetches automatically fall back to USGS's Elevation Point Query Service,
+then Open-Meteo.
+
 ## What's in the panel
 
 **Real-World Data** -- one bounding box, one topic (elevation, temperature,
@@ -57,6 +67,13 @@ design storms) and a priority-weighting preset (balanced / life-safety /
 infrastructure-protection) -- change which basins rank highest. See
 `geoai_agent/flood_tools.py`.
 
+**Analysis process** -- both the main analysis and the flood panel show a
+collapsible step-by-step trace of what the backend actually did for that
+request (fetch data, run TTK, [rank flood basins,] generate the LLM
+recommendation), each with how long it took and a JSON detail payload --
+the same visibility the CLI agent prints to a terminal, surfaced as
+structured data since a web request has no terminal to watch it run in.
+
 ## API endpoints
 
 - `POST /api/realworld/smart_query` -- `{"query": "..."}` -> an LLM
@@ -72,13 +89,13 @@ infrastructure-protection) -- change which basins rank highest. See
   optionally a cached `dataset_id` -> runs `build_real_world_dataset` (if
   not reusing a cached dataset) + `analyze_scalar_field_ttk` per layer,
   returns GeoJSON + summaries (+ an LLM recommendation for
-  `primary_variable` if requested). The final fetch+analyze action for the
-  panel.
+  `primary_variable` if requested) + a `pipeline_steps` trace. The final
+  fetch+analyze action for the panel.
 - `POST /api/realworld/flood_analyze` -- same form fields plus
   `rainfall_scenario`, `weight_preset`, optionally `runoff_coefficient` and
   a cached `dataset_id` -> ranks flood hotspots on the elevation layer
   (`flood_tools.rank_flood_basins`), returns the ranked list + GeoJSON
-  markers (+ an LLM recommendation).
+  markers (+ an LLM recommendation) + a `pipeline_steps` trace.
 
 ## Notes
 

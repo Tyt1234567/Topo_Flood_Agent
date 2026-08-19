@@ -152,6 +152,23 @@ def _morse_smale_complex(simplified_image, field_name: str):
     return msc
 
 
+def _descending_manifold_grid(msc, ny: int, nx: int) -> np.ndarray:
+    """Per-vertex basin membership: which minimum's catchment each grid
+    cell drains into, i.e. TTK's descending-manifold segmentation (port 3
+    of ttkMorseSmaleComplex -- already computed for ManifoldSize above via
+    SetComputeDescendingSegmentation(True), just never read out before
+    now). Reshaped (ny, nx) in the same row-major vertex order as the
+    input image (SetDimensions(nx, ny, 1) + values.ravel()), so grid_index
+    [i, j] here lines up directly with every other grid_index this worker
+    reports. The label values themselves are TTK-internal manifold ids,
+    not vertex ids -- callers should look up a basin's own label by
+    reading this grid at that basin's minimum's grid_index rather than
+    assuming any particular numbering scheme."""
+    seg = msc.GetOutputDataObject(3)
+    arr = numpy_support.vtk_to_numpy(seg.GetPointData().GetArray("DescendingManifold"))
+    return arr.reshape(ny, nx).astype(np.int32)
+
+
 def _separatrix_polylines(msc) -> list[dict]:
     """Groups the 1-separatrices (saddle<->extremum integral lines -- the
     boundaries between basins/peak-catchments, i.e. the terrain skeleton)
@@ -209,6 +226,8 @@ def analyze(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, field_name: str,
             "multiplicity": 0,
         }
 
+    descending_manifold = _descending_manifold_grid(msc, ny, nx) if cps.GetNumberOfPoints() > 0 else None
+
     critical_summary = {"minimum": [], "maximum": [], "saddle": []}
     basins, peak_basins = [], []
     if cps.GetNumberOfPoints() > 0:
@@ -226,7 +245,12 @@ def analyze(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, field_name: str,
             entry = describe(vid, float(elev[k]))
             critical_summary[kind].append(entry)
             if kind == "minimum":
-                basins.append({"minimum": entry, "size_cells": int(manifold_size[k]), "significant": True})
+                i, j = entry["grid_index"]
+                catchment_id = int(descending_manifold[i, j]) if descending_manifold is not None else None
+                basins.append({
+                    "minimum": entry, "size_cells": int(manifold_size[k]), "significant": True,
+                    "catchment_id": catchment_id,
+                })
             elif kind == "maximum":
                 peak_basins.append({"maximum": entry, "size_cells": int(manifold_size[k]), "significant": True})
 
@@ -263,6 +287,7 @@ def analyze(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, field_name: str,
         "peak_basins": peak_basins,
         "num_raw_saddles": raw_type_counts["saddle"],
         "separatrices": _separatrix_polylines(msc),
+        "descending_manifold": descending_manifold.tolist() if descending_manifold is not None else None,
     }
 
 

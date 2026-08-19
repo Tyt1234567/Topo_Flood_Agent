@@ -4,3 +4,4 @@ shapely
 networkx
 numpy
 pyshp
+matplotlib

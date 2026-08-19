@@ -67,6 +67,12 @@ See `web_app/`'s "Flood & drainage analysis" panel for the HITL controls
   installed in a separate Python environment with its VTK-based Python
   bindings (`geoai_agent/ttk_engine.py` shells out to it as a subprocess --
   see `TTK_PYTHON` / `TTK_BIN_DIR` in that file to point it at your install)
+- For the default US elevation source (the actual USGS 3DEP DEM raster,
+  streamed and clipped via GDAL rather than point-sampled): a QGIS install
+  for its bundled GDAL Python bindings (`geoai_agent/dem_cog_source.py`
+  shells out to `python-qgis.bat` as a subprocess -- see `QGIS_PYTHON` in
+  that file). Optional: without it, elevation falls back to USGS's slower,
+  point-count-capped Elevation Point Query Service, then Open-Meteo.
 
 ## Usage
 
@@ -106,7 +112,9 @@ human review loop as the topology branch.
 | `geoai_agent/ttk_engine.py` | Active Morse-Smale engine: shells out to a TTK-equipped Python environment as a subprocess, returns the same result shape as `morse_topology.analyze_scalar_field` plus separatrices |
 | `geoai_agent/_ttk_worker.py` | Runs inside the TTK environment only -- builds a vtkImageData from a `ScalarField`, runs TTK's persistence-simplification + Morse-Smale complex |
 | `geoai_agent/flood_tools.py` | Flood-risk / drainage-demand domain engine on top of a Morse-Smale result: weighted risk scoring, Rational-Method runoff, rainfall scenarios, HITL weight presets |
-| `geoai_agent/real_data.py` | Real-world scalar field layers: online elevation fetch (USGS 3DEP / Open-Meteo), user-CSV layers via IDW interpolation, derived slope layer |
+| `geoai_agent/real_data.py` | Real-world scalar field layers: online elevation fetch (streamed USGS 3DEP DEM COG / USGS EPQS / Open-Meteo), user-CSV layers via IDW interpolation, derived slope layer |
+| `geoai_agent/dem_cog_source.py` | Default US elevation source: shells out to a QGIS-equipped Python environment as a subprocess to stream, clip, and resample the actual USGS 3DEP DEM GeoTIFF via GDAL |
+| `geoai_agent/_gdal_dem_worker.py` | Runs inside the QGIS environment only -- resolves the needed 1-degree DEM tile(s), streams them via `/vsicurl/`, clips and resamples onto the analysis grid |
 | `geoai_agent/visualize.py` | Self-contained multi-layer Leaflet map generation for Morse analysis and flood-hotspot results |
 | `geoai_agent/integration.py` | Combines topology output with hazard/population/accessibility per structure |
 | `geoai_agent/llm_client.py` | Gemini API client (google-genai SDK) |
@@ -208,3 +216,9 @@ The Morse-Smale engine (`geoai_agent/ttk_engine.py`) looks for TTK's
 Python environment at `D:\anaconda3\envs\tda_env\python.exe` /
 `D:\TTK\bin` by default -- override with the `TTK_PYTHON` / `TTK_BIN_DIR`
 environment variables if your install lives elsewhere.
+
+The default US elevation source (`geoai_agent/dem_cog_source.py`) looks
+for QGIS's bundled Python at `D:\QGIS\bin\python-qgis.bat` by default --
+override with the `QGIS_PYTHON` environment variable if your install lives
+elsewhere. Without it, elevation automatically falls back to USGS's
+Elevation Point Query Service, then Open-Meteo.

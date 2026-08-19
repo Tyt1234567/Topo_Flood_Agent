@@ -21,13 +21,23 @@ Two ways to get a layer's data onto the analysis grid:
   query is actually about (see prompts.REALWORLD_QUERY_EXTRACTION_SYSTEM
   for how a query is mapped onto one of these).
 
-Elevation specifically has a second live source: USGS's 3DEP Elevation
-Point Query Service, genuine LiDAR-derived data (often truly ~1m
-resolution, vs. Open-Meteo's fixed ~90m SRTM) but US-only and queried one
-point at a time rather than batched. It is tried FIRST by default within
-the continental US (see build_real_world_dataset's elevation_source="auto"),
-falling back to Open-Meteo automatically if USGS fails or the location is
-outside its coverage -- see fetch_usgs_elevation_field.
+Elevation specifically has two further live sources, both USGS 3DEP-derived
+and both US-only:
+- The actual DEM raster, streamed and clipped directly from its source
+  GeoTIFF COG via GDAL (see dem_cog_source.fetch_usgs_dem_cog_field) --
+  genuinely ~10m resolution, no point-count cap, no per-point rate limit,
+  since GDAL only reads the byte ranges a given clip+resample actually
+  needs. This is tried FIRST by default within the continental US (see
+  build_real_world_dataset's elevation_source="auto").
+- USGS's Elevation Point Query Service, queried one point at a time rather
+  than batched (often truly ~1m resolution where LiDAR-covered, but far
+  slower and capped at a much smaller grid -- see fetch_usgs_elevation_field).
+  Used as a fallback if the streamed-COG source is unavailable (see
+  dem_cog_source.DEMSourceUnavailableError -- it needs a QGIS install for
+  its bundled GDAL bindings) or fails outright.
+
+Open-Meteo elevation is the final fallback if both USGS sources fail or
+the location is outside the continental US.
 
 A "slope" layer (gradient magnitude of elevation) is derived for free from
 whatever elevation data is loaded, giving a second genuinely real layer
@@ -203,6 +213,7 @@ def ground_spacing_meters(
 
 def resolution_for_target_spacing(
     bounds: tuple[float, float, float, float], target_meters: float,
+    min_resolution: int = MIN_GRID_RESOLUTION, max_resolution: int = MAX_GRID_RESOLUTION,
 ) -> tuple[int, int]:
     """Grid resolution (nx, ny) -- points along longitude and latitude
     respectively -- needed so ground_spacing_meters is approximately
@@ -212,16 +223,26 @@ def resolution_for_target_spacing(
     target_meters on the ground instead of a single shared point count
     distorting non-square boxes into non-square pixels.
 
-    Each axis is floored at MIN_GRID_RESOLUTION and ceiled at
-    MAX_GRID_RESOLUTION independently -- a large box + a fine target (e.g.
-    "30 meters" over a 13km box) can need more points than the cap allows
-    on one or both axes; the caller should compare the requested target
-    against ground_spacing_meters(bounds, result) to see if it was
-    actually achievable, and tell the user if not, rather than silently
-    returning a coarser grid than they asked for. Since both axes share
-    the same per-axis cap, the total point count (nx * ny) is always
-    bounded by MAX_GRID_RESOLUTION ** 2, the same worst-case budget the
-    old square-only grid had."""
+    Each axis is floored at min_resolution and ceiled at max_resolution
+    independently -- a large box + a fine target (e.g. "30 meters" over a
+    13km box) can need more points than the cap allows on one or both
+    axes; the caller should compare the requested target against
+    ground_spacing_meters(bounds, result) to see if it was actually
+    achievable, and tell the user if not, rather than silently returning a
+    coarser grid than they asked for. Since both axes share the same
+    per-axis cap, the total point count (nx * ny) is always bounded by
+    max_resolution ** 2, the same worst-case budget the old square-only
+    grid had.
+
+    min_resolution/max_resolution default to the module-level MIN_GRID_
+    RESOLUTION/MAX_GRID_RESOLUTION (tuned for the slow per-point sources --
+    Open-Meteo's per-minute rate limit, USGS EPQS's one-point-per-request
+    cost, see their definitions below). A caller whose actual fetch path
+    doesn't have that cost (e.g. web_app's one-box agent flow, which always
+    uses the streamed/clipped GDAL COG source -- constant ~3.5s regardless
+    of resolution) can pass a higher max_resolution explicitly; this
+    function has no way to know which source a caller will end up using,
+    so it never assumes a higher cap is safe on its own."""
     if target_meters <= 0:
         return GRID_RESOLUTION, GRID_RESOLUTION
     lat_min, lat_max, lon_min, lon_max = bounds
@@ -231,7 +252,48 @@ def resolution_for_target_spacing(
     lon_span_m = abs(lon_max - lon_min) * meters_per_deg_lon
 
     def axis_points(span_m: float) -> int:
-        return max(MIN_GRID_RESOLUTION, min(math.ceil(span_m / target_meters) + 1, MAX_GRID_RESOLUTION))
+        return max(min_resolution, min(math.ceil(span_m / target_meters) + 1, max_resolution))
+
+    return axis_points(lon_span_m), axis_points(lat_span_m)
+
+
+def resolution_for_target_spacing_scaled(
+    bounds: tuple[float, float, float, float], target_meters: float,
+    max_resolution: int = MAX_GRID_RESOLUTION, min_resolution: int = MIN_GRID_RESOLUTION,
+) -> tuple[int, int]:
+    """Like resolution_for_target_spacing, but instead of clamping each
+    axis to max_resolution independently -- which, for a non-square box,
+    can hit the cap on only the longer axis and leave the other axis at
+    its true (smaller) point count, silently turning what should be a
+    square ground pixel into a rectangular one -- this scales the
+    EFFECTIVE target spacing UP uniformly on both axes just enough that
+    the longer axis lands exactly at max_resolution. Ground pixels stay
+    square (same real-world meters on both axes) even when the requested
+    target_meters isn't achievable for a box this large; the caller gets a
+    uniformly coarser grid instead of a distorted one.
+
+    Use this (rather than resolution_for_target_spacing) whenever the
+    caller wants "as fine as the point-count budget allows, but never
+    lopsided" -- e.g. web_app's one-box agent flow, which lets a user ask
+    for an arbitrary target resolution via chat and needs the result to
+    stay sane for boxes much larger than the target was tuned for."""
+    if target_meters <= 0:
+        return GRID_RESOLUTION, GRID_RESOLUTION
+    lat_min, lat_max, lon_min, lon_max = bounds
+    mid_lat_rad = math.radians((lat_min + lat_max) / 2)
+    meters_per_deg_lon = _METERS_PER_DEGREE_LAT * math.cos(mid_lat_rad)
+    lat_span_m = abs(lat_max - lat_min) * _METERS_PER_DEGREE_LAT
+    lon_span_m = abs(lon_max - lon_min) * meters_per_deg_lon
+
+    ideal_nx = lon_span_m / target_meters + 1
+    ideal_ny = lat_span_m / target_meters + 1
+    longest_axis_points = max(ideal_nx, ideal_ny)
+    effective_target_meters = (
+        target_meters * (longest_axis_points / max_resolution) if longest_axis_points > max_resolution else target_meters
+    )
+
+    def axis_points(span_m: float) -> int:
+        return max(min_resolution, min(math.ceil(span_m / effective_target_meters) + 1, max_resolution))
 
     return axis_points(lon_span_m), axis_points(lat_span_m)
 
@@ -554,19 +616,21 @@ def build_real_world_dataset(
 
     elevation_source picks which live source an online-fetched "elevation"
     layer comes from:
-    - "auto" (the default): prefer USGS 3DEP (see fetch_usgs_elevation_field
-      -- genuinely higher precision, often ~1m, but US-only and much
-      slower, one HTTP request per point) ONLY when it can actually
-      deliver the requested resolution -- its practical point-count cap
-      (MAX_USGS_GRID_RESOLUTION) is far tighter than Open-Meteo's, so
-      silently capping a fine request down to fit USGS would mean e.g. a
-      "100m pixels" request quietly comes back much coarser instead. A
-      request that needs a finer grid than USGS can serve goes straight to
-      Open-Meteo (fast, global, ~90m, much higher point-count ceiling),
-      which can actually get close to what was asked. Either way, if the
-      chosen primary source fails outright (rate limit, outage, no 3DEP
-      coverage), the other is tried as a fallback before giving up.
-    - "usgs": USGS only, no fallback -- fails outright if USGS does.
+    - "auto" (the default): within the continental US, prefer streaming the
+      actual USGS 3DEP DEM raster (see fetch_usgs_dem_cog_field in
+      dem_cog_source.py -- clipped and resampled directly from the source
+      GeoTIFF COG via GDAL, no point-count cap, no per-point rate limit).
+      If that bridge is unavailable (no QGIS install found -- see
+      DEMSourceUnavailableError) or the fetch fails outright, falls back to
+      USGS's Elevation Point Query Service (one HTTP request per grid
+      point, so only usable up to MAX_USGS_GRID_RESOLUTION), then to
+      Open-Meteo (global, ~90m, much higher point-count ceiling but lower
+      precision) as the last resort. Outside the continental US, goes
+      straight to Open-Meteo.
+    - "usgs_dem_cog": the streamed-COG source only, no fallback -- fails
+      outright if the QGIS/GDAL bridge is unavailable or the fetch fails.
+    - "usgs": the Elevation Point Query Service only, no fallback -- fails
+      outright if USGS does.
     - "open_meteo": Open-Meteo only, no fallback -- for when the higher
       precision isn't worth the wait.
     """
@@ -586,26 +650,34 @@ def build_real_world_dataset(
             usgs_ok = is_in_continental_us(bounds)
             usgs_can_hit_target = usgs_ok and nx <= MAX_USGS_GRID_RESOLUTION and ny <= MAX_USGS_GRID_RESOLUTION
 
-            if elevation_source == "usgs":
+            if elevation_source == "usgs_dem_cog":
+                attempts = [("usgs_dem_cog", resolution)]
+            elif elevation_source == "usgs":
                 attempts = [("usgs", resolution)]
             elif elevation_source == "open_meteo":
                 attempts = [("open_meteo", resolution)]
                 if usgs_ok:
                     attempts.append(("usgs", usgs_capped_resolution))
-            elif usgs_can_hit_target:
-                attempts = [("usgs", resolution), ("open_meteo", resolution)]
             elif usgs_ok:
-                attempts = [("open_meteo", resolution), ("usgs", usgs_capped_resolution)]
+                attempts = [("usgs_dem_cog", resolution)]
+                if usgs_can_hit_target:
+                    attempts.append(("usgs", resolution))
+                attempts.append(("open_meteo", resolution))
             else:
                 attempts = [("open_meteo", resolution)]
+
+            def _fetch(source_name: str, attempt_resolution):
+                if source_name == "usgs_dem_cog":
+                    from geoai_agent.dem_cog_source import fetch_usgs_dem_cog_field
+                    return fetch_usgs_dem_cog_field(bounds, attempt_resolution)
+                if source_name == "usgs":
+                    return fetch_usgs_elevation_field(bounds, attempt_resolution)
+                return fetch_open_meteo_field("elevation", bounds, attempt_resolution)
 
             first_error = None
             for attempt_idx, (source_name, attempt_resolution) in enumerate(attempts):
                 try:
-                    fields[layer_name] = (
-                        fetch_usgs_elevation_field(bounds, attempt_resolution) if source_name == "usgs"
-                        else fetch_open_meteo_field("elevation", bounds, attempt_resolution)
-                    )
+                    fields[layer_name] = _fetch(source_name, attempt_resolution)
                     actual_elevation_source = source_name
                     if attempt_idx > 0 and first_error is not None:
                         elevation_fallback_reason = str(first_error)

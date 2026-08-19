@@ -194,6 +194,7 @@ def rank_flood_basins(
             "coords": minimum["coords"],
             "elevation_m": minimum["value"],
             "persistence_m": persistence,
+            "catchment_id": basin.get("catchment_id"),
             "contributing_area_km2": contributing_area_km2,
             "topological_score": topological_score,
             "contributing_area_score": area_score,
