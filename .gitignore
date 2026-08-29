@@ -3,5 +3,4 @@ __pycache__/
 *.pyc
 .idea/
 .claude/
-real_world_map.html
 .env

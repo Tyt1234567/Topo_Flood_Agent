@@ -1,9 +1,9 @@
 # Drainage database dump
 
 `drainage_dump.sql.gz` is a full `pg_dump` of the local PostGIS database
-that `geoai_agent/drainage_db.py` reads from (stormwater pipes and catch
+that `web_app/geoai_agent/drainage_db.py` reads from (stormwater pipes and catch
 basins for DC, Austin, Charlotte, Anne Arundel, Fairfax, Loudoun, and PG
-County -- loaded via the `load_*_stormwater.py` scripts at the repo root).
+County -- loaded via the `web_app/load_*_stormwater.py` scripts).
 
 ## Restoring it
 

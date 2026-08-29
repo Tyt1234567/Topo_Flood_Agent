@@ -1,9 +1,0 @@
-google-genai
-shapely
-networkx
-numpy
-flask
-pyshp
-matplotlib
-psycopg2-binary
-python-dotenv
