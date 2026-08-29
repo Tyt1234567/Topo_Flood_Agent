@@ -22,22 +22,18 @@ set as the `GEMINI_API_KEY` environment variable, for the LLM-driven
 routing and recommendation steps. Open http://localhost:5000 once it's
 running.
 
-Morse-Smale analysis is computed by TTK (the Topology ToolKit,
-https://topology-tool-kit.github.io/) rather than a bundled Python
-dependency: `geoai_agent/ttk_engine.py` shells out to a separate conda
-environment with TTK's VTK-based Python bindings installed (see the
-`TTK_PYTHON` / `TTK_BIN_DIR` env vars in that file if your TTK install
-isn't at the default `D:\anaconda3\envs\tda_env` / `D:\TTK\bin` paths).
+## Configuration
 
-The default elevation source within the continental US is the actual USGS
-3DEP DEM raster, streamed straight from its source GeoTIFF and clipped to
-the requested area via GDAL (no point-count cap, unlike the older
-point-by-point USGS service still used as a fallback):
-`geoai_agent/dem_cog_source.py` shells out to QGIS's bundled Python (see
-the `QGIS_PYTHON` env var in that file if your QGIS install isn't at the
-default `D:\QGIS\bin\python-qgis.bat`). Without a QGIS install, elevation
-fetches automatically fall back to USGS's Elevation Point Query Service,
-then Open-Meteo.
+Copy the repo root's `.env.example` to `.env` (either at the repo root or
+inside `web_app/` -- both work) and fill in what you need. Full details
+in the root `README.md`'s Configuration section; short version:
+
+| Variable | Required? | Purpose |
+|---|---|---|
+| `GEMINI_API_KEY` | Yes | LLM routing/recommendation calls |
+| `DATABASE_URL` | No | Real stormwater pipe/catch-basin data (`geoai_agent/drainage_db.py`) -- see `../db_dump/README.md` to restore the bundled sample dataset |
+| `TTK_PYTHON`, `TTK_BIN_DIR` | No | Discrete-Morse (TTK) terrain analysis, if not at the defaults in `geoai_agent/ttk_engine.py` |
+| `QGIS_PYTHON` | No | Primary US elevation source (streamed USGS 3DEP DEM via GDAL), if not at the default in `geoai_agent/dem_cog_source.py`. Without it, elevation automatically falls back to USGS's Elevation Point Query Service, then Open-Meteo. |
 
 ## What's in the panel
 

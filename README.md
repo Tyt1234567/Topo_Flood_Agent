@@ -194,14 +194,24 @@ the town's road graph and zones and has no real-world equivalent here.
 
 ## Configuration
 
-The LLM backend is Gemini (`geoai_agent/llm_client.py`, via the
-`google-genai` SDK), reading the API key from the `GEMINI_API_KEY`
-environment variable and defaulting to a pinned stable model
+Copy `.env.example` to `.env` and fill in whichever of these you need --
+`.env` is gitignored, loaded automatically via `python-dotenv`. Every
+setting below has a name-matched environment variable, so setting them
+directly in your shell instead of a `.env` file works the same way.
+
+| Variable | Required? | Purpose |
+|---|---|---|
+| `GEMINI_API_KEY` | Yes | LLM backend (`geoai_agent/llm_client.py`, via the `google-genai` SDK). Free tier: https://aistudio.google.com/apikey |
+| `DATABASE_URL` | No | Real stormwater pipe/catch-basin data (`geoai_agent/drainage_db.py`), a `postgresql://user:pass@host:port/dbname` PostGIS connection. Without it, that layer is silently skipped, same as any other missing data source. See `db_dump/README.md` to restore the bundled sample dataset (DC, Austin, Charlotte, Anne Arundel, Fairfax, Loudoun, PG County), or `load_*_stormwater.py` at the repo root to load another city yourself. |
+| `TTK_PYTHON`, `TTK_BIN_DIR` | No (needed for Morse-Smale analysis) | Point at a Python environment with TTK's (Topology ToolKit, https://topology-tool-kit.github.io/) VTK-based Python bindings installed, if not at the defaults baked into `geoai_agent/ttk_engine.py` (`D:\anaconda3\envs\tda_env\python.exe` / `D:\TTK\bin`). |
+| `QGIS_PYTHON` | No (needed for the primary US elevation source) | Point at QGIS's bundled Python (`python-qgis.bat`), if not at the default baked into `geoai_agent/dem_cog_source.py` (`D:\QGIS\bin\python-qgis.bat`). Without it, elevation automatically falls back to USGS's Elevation Point Query Service, then Open-Meteo. |
+
+`GEMINI_API_KEY` defaults `LLMClient` to a pinned stable model
 (`LLMClient.DEFAULT_MODEL`) rather than a `-latest` alias -- Google's
 `-latest` aliases can point at a brand-new preview model with a much
 tighter free-tier daily quota than an established stable snapshot. To use
-a different model or a separate API key, construct `GeoAIAgent` with a
-custom `LLMClient`:
+a different model or a separate API key in code instead of the env var,
+construct `GeoAIAgent` with a custom `LLMClient`:
 
 ```python
 from geoai_agent.agent import GeoAIAgent
@@ -211,14 +221,3 @@ llm = LLMClient(model="gemini-3.5-flash", api_key="...")
 agent = GeoAIAgent(llm_client=llm)
 agent.run("your query")
 ```
-
-The Morse-Smale engine (`geoai_agent/ttk_engine.py`) looks for TTK's
-Python environment at `D:\anaconda3\envs\tda_env\python.exe` /
-`D:\TTK\bin` by default -- override with the `TTK_PYTHON` / `TTK_BIN_DIR`
-environment variables if your install lives elsewhere.
-
-The default US elevation source (`geoai_agent/dem_cog_source.py`) looks
-for QGIS's bundled Python at `D:\QGIS\bin\python-qgis.bat` by default --
-override with the `QGIS_PYTHON` environment variable if your install lives
-elsewhere. Without it, elevation automatically falls back to USGS's
-Elevation Point Query Service, then Open-Meteo.
