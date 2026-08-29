@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 
 import numpy as np
-from shapely.geometry import Point, shape as shapely_shape
+from shapely.geometry import Point, Polygon, mapping, shape as shapely_shape
 from shapely.geometry.base import BaseGeometry
 
 _NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
@@ -92,6 +92,109 @@ def geocode_place_boundary(place_name: str, timeout: float = 15.0) -> dict | Non
     }
 
 
+def boundary_from_drawn_polygon(points: list, name: str = "Custom drawn area") -> dict:
+    """Builds the same {"name", "display_name", "bounds", "polygon", "geojson"}
+    shape geocode_place_boundary returns, but from a polygon the user drew by
+    hand on the map instead of looking one up -- lets agent_analyze_stream
+    treat "manually drawn boundary" and "real place boundary" identically for
+    everything downstream (DEM clipping, hotspot within/outside tagging, the
+    boundary outline drawn on the map).
+
+    `points` is [[lat, lon], ...], the order Leaflet click events give them
+    in (not GeoJSON's [lon, lat]) -- needs at least 3 vertices. Raises
+    ValueError on anything that can't become a valid polygon (too few
+    points, non-numeric coordinates, a ring so self-intersecting that even
+    a zero-width buffer can't repair it), so the caller can turn that into a
+    plain-language error for the user rather than a raw shapely exception.
+    """
+    if not points or len(points) < 3:
+        raise ValueError("a boundary needs at least 3 points")
+    try:
+        coords_lonlat = [(float(lon), float(lat)) for lat, lon in points]
+    except (TypeError, ValueError):
+        raise ValueError("each point must be a [lat, lon] pair of numbers")
+    if coords_lonlat[0] != coords_lonlat[-1]:
+        coords_lonlat.append(coords_lonlat[0])  # shapely/GeoJSON polygon rings must close
+
+    polygon = Polygon(coords_lonlat)
+    if not polygon.is_valid:
+        polygon = polygon.buffer(0)  # repairs the self-intersecting rings a hand-drawn shape can produce
+    if not polygon.is_valid or polygon.is_empty:
+        raise ValueError("drawn boundary is not a valid polygon (likely self-intersecting)")
+
+    lons = [c[0] for c in coords_lonlat]
+    lats = [c[1] for c in coords_lonlat]
+    south, north, west, east = min(lats), max(lats), min(lons), max(lons)
+    lat_span, lon_span = (north - south) or 1e-4, (east - west) or 1e-4
+    bounds = (
+        south - lat_span * _BOUNDARY_PADDING_FRACTION,
+        north + lat_span * _BOUNDARY_PADDING_FRACTION,
+        west - lon_span * _BOUNDARY_PADDING_FRACTION,
+        east + lon_span * _BOUNDARY_PADDING_FRACTION,
+    )
+    return {
+        "name": name,
+        "display_name": name,
+        "bounds": bounds,
+        "polygon": polygon,
+        "geojson": mapping(polygon),
+    }
+
+
+def boundary_from_shapefile(path: str, name: str = "Uploaded boundary") -> dict:
+    """Builds the same {"name", "display_name", "bounds", "polygon", "geojson"}
+    shape geocode_place_boundary returns, but from a user-uploaded shapefile
+    of POLYGON geometry (a .zip bundling .shp/.shx/.dbf, or a bare .shp
+    alongside its sidecar files) instead of looking one up or drawing it by
+    hand -- for a user who already has an exact boundary on hand (a parcel,
+    a watershed delineation, an administrative unit not in OpenStreetMap...).
+    Reads coordinates as-is (no reprojection from a .prj CRS), the same
+    simplifying assumption real_data.py's load_shapefile_points already
+    makes for point-sample shapefiles: the file's coordinates are expected
+    to already be WGS84 lon/lat.
+
+    Every polygon feature in the file is unioned into one boundary, so a
+    shapefile of several adjoining parcels/tiles making up one site still
+    works. Raises ValueError on anything that can't become a boundary (wrong
+    shape type, no features, a ring even a zero-width buffer can't repair),
+    so the caller can turn that into a plain-language error for the user.
+    """
+    import shapefile
+    from shapely.ops import unary_union
+
+    reader = shapefile.Reader(path)
+    if reader.shapeType not in (shapefile.POLYGON, shapefile.POLYGONZ, shapefile.POLYGONM):
+        raise ValueError(
+            f"shapefile '{path}' has shape type {reader.shapeType!r}, expected POLYGON "
+            "(the analysis boundary's outline)"
+        )
+    shapes = reader.shapes()
+    if not shapes:
+        raise ValueError(f"shapefile '{path}' has no features")
+
+    polygon = unary_union([shapely_shape(s.__geo_interface__) for s in shapes])
+    if not polygon.is_valid:
+        polygon = polygon.buffer(0)  # repairs the occasional self-intersecting ring
+    if not polygon.is_valid or polygon.is_empty:
+        raise ValueError("shapefile boundary is not a valid polygon (likely self-intersecting)")
+
+    west, south, east, north = polygon.bounds
+    lat_span, lon_span = (north - south) or 1e-4, (east - west) or 1e-4
+    bounds = (
+        south - lat_span * _BOUNDARY_PADDING_FRACTION,
+        north + lat_span * _BOUNDARY_PADDING_FRACTION,
+        west - lon_span * _BOUNDARY_PADDING_FRACTION,
+        east + lon_span * _BOUNDARY_PADDING_FRACTION,
+    )
+    return {
+        "name": name,
+        "display_name": name,
+        "bounds": bounds,
+        "polygon": polygon,
+        "geojson": mapping(polygon),
+    }
+
+
 def grid_inside_polygon_mask(xs: np.ndarray, ys: np.ndarray, polygon: BaseGeometry) -> np.ndarray:
     """Boolean (ny, nx) mask of which grid nodes fall inside `polygon`.
     shapely has no bulk vectorized contains check without an optional
@@ -118,7 +221,85 @@ def tag_hotspots_within_boundary(hotspots: list[dict], polygon: BaseGeometry) ->
         h["within_boundary"] = bool(polygon.contains(Point(x, y)))
 
 
-def clip_field_to_polygon(field, polygon: BaseGeometry, wall_margin_fraction: float = 0.5):
+def clip_geojson_to_polygon(geojson: dict | None, polygon: BaseGeometry) -> dict | None:
+    """Clips a GeoJSON FeatureCollection (points, lines, or polygons -- any
+    mix) down to what actually falls inside `polygon`, the same real place
+    boundary tag_hotspots_within_boundary/clip_field_to_polygon already use
+    elsewhere. Added so every map layer this project draws respects the
+    SAME boundary once one is resolved -- before this, elevation, FEMA
+    flood zones, stormwater pipes, and river gauges were all fetched over
+    the padded rectangular bounding box and shown in full, while hotspots/
+    buildings/the elevation topology were already clipped to the real
+    place shape -- an inconsistent, "why does this bit stick out past the
+    boundary line but not that bit" look.
+
+    - Point features: kept as-is if inside the polygon, dropped entirely
+      otherwise (a gauge or marker either is or isn't in the place; there's
+      no partial version of a point to keep).
+    - Line/polygon features: replaced with their actual geometric
+      intersection with `polygon` (not just an in/out test) -- a FEMA zone
+      or pipe that only partly overlaps the boundary keeps the overlapping
+      part, same as how a real GIS "clip to boundary" operation works,
+      rather than being dropped whole or left un-clipped. A feature with NO
+      overlap at all is dropped. `shapely.intersection` can occasionally
+      return a GeometryCollection (e.g. a line that grazes the boundary at
+      one point and crosses it properly elsewhere) -- only the components
+      matching the original geometry's own type family are kept from that,
+      so a stray zero-area Point component doesn't turn a polygon feature
+      into a degenerate geometry.
+
+    `geojson` may be None or empty (no data fetched this run) -- passed
+    through unchanged, matching every other "nothing to do" case in this
+    project's data pipeline."""
+    if not geojson or not geojson.get("features"):
+        return geojson
+    from shapely.ops import unary_union
+    from shapely.prepared import prep
+
+    prepared = prep(polygon)
+    _POLYGONAL = {"Polygon", "MultiPolygon"}
+    _LINEAR = {"LineString", "MultiLineString"}
+
+    def _matching_parts(geom, want_types: set) -> list:
+        if geom.geom_type in want_types:
+            return [] if geom.is_empty else [geom]
+        if geom.geom_type == "GeometryCollection":
+            return [g for g in geom.geoms if g.geom_type in want_types and not g.is_empty]
+        return []
+
+    clipped_features = []
+    for feature in geojson["features"]:
+        geometry = feature.get("geometry")
+        if not geometry:
+            continue
+        geom = shapely_shape(geometry)
+        if geom.geom_type == "Point":
+            if prepared.contains(geom):
+                clipped_features.append(feature)
+            continue
+
+        want_types = _POLYGONAL if geom.geom_type in _POLYGONAL else _LINEAR
+        try:
+            intersection = polygon.intersection(geom)
+        except Exception:
+            continue
+        parts = _matching_parts(intersection, want_types)
+        if not parts:
+            continue
+        # unary_union of one part is just that part unchanged; of several
+        # (a GeometryCollection's matching pieces) it combines them back
+        # into a single Multi* geometry, same effect as manually building
+        # a MultiPolygon/MultiLineString but without needing to pick which
+        # constructor matches `want_types`.
+        clipped_geom = parts[0] if len(parts) == 1 else unary_union(parts)
+        new_feature = dict(feature)
+        new_feature["geometry"] = mapping(clipped_geom)
+        clipped_features.append(new_feature)
+
+    return {"type": "FeatureCollection", "features": clipped_features}
+
+
+def clip_field_to_polygon(field, polygon: BaseGeometry, wall_margin_fraction: float = 0.5, mask: np.ndarray | None = None):
     """Returns a COPY of `field` (same class, e.g. ScalarField) with every
     grid cell outside `polygon` raised to "wall" ground well above the real
     data's max -- so TTK's Morse-Smale complex, which finds LOCAL MINIMA,
@@ -151,8 +332,15 @@ def clip_field_to_polygon(field, polygon: BaseGeometry, wall_margin_fraction: fl
     A basin whose true lowest point is very close to the boundary edge can
     still get pulled toward the wall (the same edge-effect real watershed
     tools accept when clipping to a boundary that isn't itself a ridge) --
-    worth disclosing, not a bug to "fix" away."""
-    mask_inside = grid_inside_polygon_mask(field.xs, field.ys, polygon)
+    worth disclosing, not a bug to "fix" away.
+
+    `mask`, if given, is a precomputed grid_inside_polygon_mask(field.xs,
+    field.ys, polygon) -- lets a caller that already needs the same mask
+    for something else (e.g. flood_tools.rank_flood_basins's
+    boundary_mask, to keep contributing-area totals from counting this
+    function's own synthetic wall cells) reuse it instead of paying the
+    O(nx*ny) shapely contains-check cost twice."""
+    mask_inside = mask if mask is not None else grid_inside_polygon_mask(field.xs, field.ys, polygon)
     real_min, real_max = float(field.values.min()), float(field.values.max())
     span = (real_max - real_min) or 1.0
     wall_base = real_max + span * wall_margin_fraction

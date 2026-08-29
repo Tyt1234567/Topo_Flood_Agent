@@ -5,3 +5,5 @@ numpy
 flask
 pyshp
 matplotlib
+psycopg2-binary
+python-dotenv

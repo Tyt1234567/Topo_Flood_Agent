@@ -427,9 +427,20 @@ def scalar_field_from_upload(
     name: str, path: str, bounds: tuple[float, float, float, float],
     resolution: int | tuple[int, int] = GRID_RESOLUTION, power: float = 2.0,
 ) -> ScalarField:
-    """Builds a ScalarField for `name` by IDW-interpolating user-supplied
-    scattered samples (CSV or shapefile, see load_layer_points) onto the
-    analysis grid over `bounds`."""
+    """Builds a ScalarField for `name` from a user-uploaded file over `bounds`.
+
+    A GeoTIFF (.tif/.tiff) -- e.g. a user's own DEM -- is clipped,
+    reprojected, and resampled directly onto the analysis grid via GDAL
+    (dem_cog_source.fetch_local_raster_field, the same QGIS-bundled-GDAL
+    subprocess bridge the live USGS DEM COG source uses, since this
+    project's main environment has no GDAL bindings). Anything else (CSV,
+    or a shapefile .zip/.shp of POINT features) is treated as scattered
+    point samples and IDW-interpolated onto the grid, as before.
+    """
+    lower = path.lower()
+    if lower.endswith(".tif") or lower.endswith(".tiff"):
+        from geoai_agent.dem_cog_source import fetch_local_raster_field  # local import: avoid a hard GDAL/QGIS dependency for callers that never upload a raster
+        return fetch_local_raster_field(name, path, bounds, resolution)
     px, py, pv = load_layer_points(path)
     xs, ys = _grid(bounds, resolution)
     values = idw_interpolate(px, py, pv, xs, ys, power=power)
@@ -582,6 +593,119 @@ def fetch_elevation_field(
     """Fetches real terrain elevation -- thin wrapper over
     fetch_open_meteo_field kept for existing callers (real_world_example.py)."""
     return fetch_open_meteo_field("elevation", bounds, resolution)
+
+
+_CENSUS_BLOCKGROUPS_URL = (
+    "https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/"
+    "USA_Census_BlockGroups/FeatureServer/0/query"
+)
+_SQ_MILES_PER_SQ_KM = 0.386102  # 1 km2 = 0.386102 mi2 (1 mi2 = 2.58999 km2)
+
+
+def fetch_population_exposure_field(
+    bounds: tuple[float, float, float, float], resolution: int | tuple[int, int] = GRID_RESOLUTION,
+) -> ScalarField:
+    """Live-fetches US Census block-group population density (people per
+    km2, 2020-Census-based) over `bounds` from Esri's ArcGIS Living Atlas
+    `USA_Census_BlockGroups` FeatureServer, and rasterizes it onto the
+    analysis grid -- a genuine, automatic exposure layer, rather than the
+    entirely-optional user-upload this project relied on exclusively before
+    (see flood_tools.rank_flood_basins's `exposure_field` parameter, and
+    WEIGHT_PRESETS["life_safety"], which was previously only ever usable
+    when a user happened to supply their own file).
+
+    This Esri-hosted mirror is used instead of the Census Bureau's own data
+    API deliberately: the Bureau's API now requires a free signup key,
+    which would break this project's established no-key live-fetch
+    philosophy (every other source here -- USGS, Open-Meteo, FEMA NFHL,
+    Overpass, NOAA Atlas 14 -- needs none). The Living Atlas layer needs no
+    key, is bbox-queryable, and already carries a precomputed POP_SQMI
+    (population per square mile) field per block group, sourced from the
+    same underlying Census data.
+
+    Raises RuntimeError if the service is unreachable or returns no block
+    groups for this area (this project has no live US Census coverage
+    outside the US, obviously, but also no data for water/unpopulated areas
+    with no block-group polygon at all) -- callers should catch this and
+    treat it as "no exposure data for this run", the same way build_real_
+    world_dataset callers already handle any other unavailable live source
+    (e.g. web_app's agent flow: an exposure-fetch failure just means that
+    scoring factor falls back to flood_tools' neutral 0.5 default, not a
+    failed run).
+
+    US-only, block-group scale (typically a few hundred to a few thousand
+    people per polygon in an urban area) -- not building-level, but a
+    material improvement over "no exposure signal unless the user happens
+    to have their own file"."""
+    from shapely.geometry import Point, Polygon
+    from shapely.strtree import STRtree
+
+    lat_min, lat_max, lon_min, lon_max = bounds
+    query = urllib.parse.urlencode({
+        "geometry": f"{lon_min},{lat_min},{lon_max},{lat_max}",
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "POPULATION,POP_SQMI,SQMI,FIPS",
+        "returnGeometry": "true",
+        "f": "json",
+    })
+    try:
+        with urllib.request.urlopen(f"{_CENSUS_BLOCKGROUPS_URL}?{query}", timeout=20) as resp:
+            payload = json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
+        raise RuntimeError(f"US Census block-group service request failed: {exc}") from exc
+
+    features = payload.get("features") or []
+    if not features:
+        raise RuntimeError(
+            "no US Census block groups returned for this area (outside US coverage, "
+            "or an area with no block-group polygons at all)"
+        )
+
+    polygons = []
+    densities_per_km2 = []
+    for feature in features:
+        attrs = feature.get("attributes", {})
+        pop_sqmi = attrs.get("POP_SQMI")
+        rings = (feature.get("geometry") or {}).get("rings")
+        if pop_sqmi is None or not rings:
+            continue
+        try:
+            polygon = Polygon(rings[0], holes=rings[1:]) if len(rings) > 1 else Polygon(rings[0])
+        except Exception:
+            continue
+        if not polygon.is_valid or polygon.is_empty:
+            continue
+        polygons.append(polygon)
+        # POP_SQMI is people per SQUARE MILE; a km2 is smaller than a mi2,
+        # so people-per-km2 is the SMALLER number -- multiply by the
+        # mi2->km2 area ratio, don't divide (dividing would inflate density
+        # by ~6.7x, e.g. turning a plausible 8,000/km2 DC block group into
+        # an implausible 54,000/km2).
+        densities_per_km2.append(pop_sqmi * _SQ_MILES_PER_SQ_KM)
+
+    if not polygons:
+        raise RuntimeError("US Census block groups were returned but none had usable population/geometry data")
+
+    tree = STRtree(polygons)
+    xs, ys = _grid(bounds, resolution)
+    xx, yy = np.meshgrid(xs, ys)
+    values = np.zeros(xx.shape, dtype=float)
+
+    for row in range(xx.shape[0]):
+        for col in range(xx.shape[1]):
+            point = Point(float(xx[row, col]), float(yy[row, col]))
+            # STRtree.query(geometry, predicate) tests predicate(geometry,
+            # tree_geometry) -- i.e. "is this point WITHIN a tree polygon",
+            # not "does this point CONTAIN a tree polygon" (which is never
+            # true for a point query and would silently return nothing).
+            candidates = tree.query(point, predicate="within")
+            if len(candidates):
+                values[row, col] = densities_per_km2[int(candidates[0])]
+            # else: no block group at this node (e.g. open water) -- left at 0.0
+
+    return ScalarField(name="exposure", xs=xs, ys=ys, values=values)
 
 
 def derive_slope_field(elevation: ScalarField) -> ScalarField:

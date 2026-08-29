@@ -19,7 +19,7 @@ import json
 import os
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 DEFAULT_MODEL = "gemini-3.5-flash"
 # The SDK has no default request timeout -- a slow/stalled path to Google's
@@ -33,8 +33,20 @@ DEFAULT_MODEL = "gemini-3.5-flash"
 # of a top-10 sample -- a bigger prompt plus a request to enumerate/filter
 # over it takes noticeably longer to generate, and 30s was observed to
 # genuinely trip (504 DEADLINE_EXCEEDED, not a hang) on exactly that kind
-# of "list every basin matching X" chat question.
-_REQUEST_TIMEOUT_MS = 60_000
+# of "list every basin matching X" chat question. Raised again to 90s once
+# the flood-recommendation prompt grew to include land-cover/soil-derived
+# per-basin runoff coefficients, river-gauge readings, TWI, building
+# exposure, and the six-return-period expected-annual-runoff aggregation --
+# a genuinely larger structured payload for the model to read and
+# synthesize into prose, observed directly to occasionally exceed 60s now.
+_REQUEST_TIMEOUT_MS = 90_000
+# One retry for a plain chat() call (the recommendation/QA paths, not the
+# already-retried chat_json): a request that times out due to a transient
+# network stall (this sandbox's own docstring-documented intermittent path
+# to Google's API, not a real service outage) often succeeds cleanly on a
+# fresh attempt: the risk-ranking JSON re-serializes identically each call,
+# so a retry costs one more request, not a different or stale prompt.
+_CHAT_MAX_ATTEMPTS = 2
 
 
 class LLMClient:
@@ -46,13 +58,37 @@ class LLMClient:
         )
 
     def chat(self, system_prompt: str, user_prompt: str) -> str:
-        """Plain-text completion."""
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(system_instruction=system_prompt),
-        )
-        return response.text
+        """Plain-text completion. Retries once on a timeout (see
+        _CHAT_MAX_ATTEMPTS) -- a transient network stall reaching Google's
+        API, not a malformed-response issue (that's chat_json's concern
+        below), so the fix here is just "try again", not "repair the text".
+
+        Does NOT retry a `genai.errors.ClientError` (any 4xx -- most
+        importantly 429 RESOURCE_EXHAUSTED, this project's documented
+        free-tier daily quota limit, but also a bad request or an auth
+        failure): a real bug caught by review -- the original `except
+        Exception` retried EVERY failure including permanent ones, so once
+        the daily quota was hit, every subsequent chat() call burned 2
+        requests against that same exhausted quota instead of failing fast
+        on the first. A raw network stall/timeout raises a plain httpx/
+        socket exception here, not a ClientError (there's no HTTP response
+        to build one from), so those still get their one retry."""
+        last_error: Exception | None = None
+        for attempt in range(_CHAT_MAX_ATTEMPTS):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=user_prompt,
+                    config=types.GenerateContentConfig(system_instruction=system_prompt),
+                )
+                return response.text
+            except errors.ClientError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt == _CHAT_MAX_ATTEMPTS - 1:
+                    raise
+        raise last_error  # unreachable, satisfies static analysis
 
     def chat_json(self, system_prompt: str, user_prompt: str, max_attempts: int = 3) -> dict:
         """Completion constrained to a single JSON object.

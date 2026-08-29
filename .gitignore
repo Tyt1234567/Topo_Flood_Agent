@@ -4,3 +4,4 @@ __pycache__/
 .idea/
 .claude/
 real_world_map.html
+.env

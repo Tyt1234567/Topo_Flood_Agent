@@ -34,6 +34,7 @@ from geoai_agent.morse_topology import ScalarField
 
 QGIS_PYTHON = os.environ.get("QGIS_PYTHON", r"D:\QGIS\bin\python-qgis.bat")
 _WORKER_SCRIPT = str(Path(__file__).resolve().parent / "_gdal_dem_worker.py")
+_LOCAL_RASTER_WORKER_SCRIPT = str(Path(__file__).resolve().parent / "_gdal_local_raster_worker.py")
 _SUBPROCESS_TIMEOUT_SECONDS = 120
 
 
@@ -108,3 +109,48 @@ def fetch_usgs_dem_cog_field(
 
     xs, ys = _grid(bounds, resolution)
     return ScalarField(name="elevation", xs=xs, ys=ys, values=values)
+
+
+def fetch_local_raster_field(
+    name: str, local_path: str, bounds: tuple[float, float, float, float],
+    resolution: int | tuple[int, int],
+) -> ScalarField:
+    """Clips, reprojects, and resamples a user-uploaded local GeoTIFF
+    (.tif/.tiff -- e.g. their own DEM or a raster exposure/population layer)
+    onto the analysis grid over `bounds`, via the same QGIS-bundled-GDAL
+    subprocess bridge fetch_usgs_dem_cog_field uses (this project's main
+    environment has no GDAL bindings installed). Unlike that function, the
+    source here is an arbitrary local file already on disk rather than a
+    known-EPSG:4326 /vsicurl/ URL, so the worker reprojects on the fly
+    (see _gdal_local_raster_worker.py) instead of assuming the source CRS.
+    """
+    _check_available()
+    from geoai_agent.real_data import _as_axis_counts, _grid  # local import: avoid a circular import at module load
+
+    lat_min, lat_max, lon_min, lon_max = bounds
+    nx, ny = _as_axis_counts(resolution)
+
+    with tempfile.TemporaryDirectory(prefix="local_raster_") as tmp_dir:
+        out_path = Path(tmp_dir) / "raster.npz"
+        proc = subprocess.run(
+            [
+                QGIS_PYTHON, _LOCAL_RASTER_WORKER_SCRIPT, str(Path(local_path).resolve()), str(out_path),
+                str(lat_min), str(lat_max), str(lon_min), str(lon_max), str(nx), str(ny),
+            ],
+            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Uploaded raster '{Path(local_path).name}' could not be processed (exit {proc.returncode}): "
+                f"{proc.stderr or proc.stdout}"
+            )
+        with np.load(out_path) as data:
+            values = data["values"]
+
+    # GDAL reads top row = north; the rest of this codebase's grids
+    # (ys = linspace(lat_min, lat_max, ny)) run south-to-north.
+    values = np.flipud(values)
+    values = _fill_nan_nearest(values)
+
+    xs, ys = _grid(bounds, resolution)
+    return ScalarField(name=name, xs=xs, ys=ys, values=values)

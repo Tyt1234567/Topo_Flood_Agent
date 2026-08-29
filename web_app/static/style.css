@@ -16,6 +16,20 @@
 
 * { box-sizing: border-box; }
 
+/* A plain author-stylesheet rule that sets `display` on an element (e.g.
+   `button{display:inline-block}`, `.interject-row{display:flex}`) always
+   beats the browser's own `[hidden]{display:none}` UA-stylesheet rule,
+   REGARDLESS of selector specificity -- author styles win over UA styles
+   unconditionally. Without this, setting `.hidden = true` in JS on such an
+   element does nothing visible. Caught twice this session: once for
+   `.interject-row`/`.checkpoint-row` (fixed locally, per-selector, below),
+   and again by review for `#progress-retry` (`button{display:inline-block}`
+   at the "Try a different place" button, meaning it never actually hides
+   itself between runs) -- a `!important` rule here, once, covers every
+   current and future toggled element instead of requiring a matching
+   `.foo[hidden]{display:none}` to be remembered for each new component. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;
@@ -24,11 +38,20 @@ html, body {
   background: var(--bg-panel);
 }
 
-/* -- two-column app shell ------------------------------------------------ */
+/* -- app root: the two-column shell (left panel + map) stacked above a ---- */
+/* full-width report/chat strip pinned to the bottom third of the page     */
+
+.app-root {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
 
 .app-shell {
   display: flex;
-  height: 100vh;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -85,9 +108,75 @@ html, body {
 .map-empty-state[hidden] { display: none; }
 
 @media (max-width: 900px) {
-  .app-shell { flex-direction: column; height: auto; min-height: 100vh; }
+  .app-root { height: auto; overflow: visible; }
+  .app-shell { flex-direction: column; height: auto; min-height: 60vh; }
   .left-panel { width: 100%; flex: none; border-right: none; border-bottom: 1px solid var(--border); max-height: none; }
   .map-panel { height: 60vh; }
+  #report-card.floating-window { left: 4vw !important; right: 4vw !important; width: 92vw !important; }
+}
+
+/* -- report window: a floating, draggable, resizable panel over the map -- */
+/* (chat lives back in the left panel -- see #chat-panel below). Position   */
+/* defaults to a viewport-anchored corner (top/right) purely via CSS;       */
+/* dragging (see main.js's initFloatingReportWindow) switches it to an      */
+/* explicit inline left/top the first time, same "inline style wins over    */
+/* the class rule" pattern the old bottom-strip resize used. Resizing sets  */
+/* explicit inline width/height directly -- no flex-basis quirks here,      */
+/* position:fixed takes it out of any flex flow entirely.                  */
+
+#report-card.floating-window {
+  position: fixed;
+  top: 76px;
+  right: 24px;
+  width: 46vw;
+  height: 60vh;
+  min-width: 380px;
+  min-height: 240px;
+  max-width: 96vw;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 18px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  box-shadow: 0 14px 36px rgba(20, 30, 40, 0.28);
+  overflow: hidden;
+  z-index: 2000;
+}
+#report-card.floating-window[hidden] { display: none; }
+
+.report-toolbar {
+  cursor: move;
+  user-select: none;
+  touch-action: none;
+}
+
+/* -- resize grip, bottom-right corner of the floating window -------------- */
+
+.floating-resize-handle {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  touch-action: none;
+}
+.floating-resize-handle::after {
+  content: "";
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 10px;
+  height: 10px;
+  border-right: 2px solid var(--border);
+  border-bottom: 2px solid var(--border);
+  border-radius: 0 0 2px 0;
+}
+.floating-resize-handle:hover::after,
+.floating-resize-handle.dragging::after {
+  border-color: var(--accent);
 }
 
 /* -- cards ------------------------------------------------------------- */
@@ -140,6 +229,37 @@ html, body {
   outline-offset: 0;
   border-color: var(--accent);
 }
+
+.draw-boundary-hint { margin: 8px 0 0; }
+
+.objective-row { margin: 10px 0 0; }
+.objective-row input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  background: white;
+}
+.objective-row input:focus {
+  outline: 2px solid #bcd6ee;
+  outline-offset: 0;
+  border-color: var(--accent);
+}
+
+.link-button {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: inherit;
+  font-weight: 500;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.link-button:hover { color: var(--accent-dark); }
 
 /* -- buttons ------------------------------------------------------------- */
 
@@ -261,6 +381,18 @@ button.secondary:hover, a.secondary:hover { background: #eef4fa; }
   gap: 8px;
 }
 
+.pipeline-step-label { flex: 1 1 auto; }
+
+.step-modify-btn {
+  flex: 0 0 auto;
+  padding: 3px 9px;
+  font-size: 11.5px;
+}
+.step-modify-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .step-dot {
   flex: 0 0 8px;
   width: 8px;
@@ -277,6 +409,30 @@ button.secondary:hover, a.secondary:hover { background: #eef4fa; }
 @keyframes dot-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
+}
+
+.agent-decision-step {
+  border-color: var(--accent);
+  border-width: 1px 1px 1px 3px;
+  background: #eef5fb;
+}
+.agent-decision-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: white;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.agent-decision-reasoning {
+  margin: 0;
+  padding: 0 10px 9px;
+  font-size: 12px;
+  color: var(--text-muted, #555);
 }
 
 .pipeline-step pre {
@@ -298,7 +454,15 @@ button.secondary:hover, a.secondary:hover { background: #eef4fa; }
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
+  /* Must beat #report-card.floating-window's z-index:2000 -- a real bug
+     caught while recording a demo: the report window defaults to the
+     top-right and modals center on screen, so they don't usually collide,
+     but the report window is DRAGGABLE (see report-toolbar/initFloating
+     ReportWindow), and once dragged over a modal's screen position, the
+     modal's own buttons became unclickable (the report iframe intercepted
+     every click) with no visual sign anything was wrong -- the overlay's
+     dim background was still drawn UNDER the report window too. */
+  z-index: 2100;
 }
 .modal-overlay[hidden] { display: none; }
 
@@ -326,15 +490,36 @@ button.secondary:hover, a.secondary:hover { background: #eef4fa; }
   font-size: 12.5px;
 }
 
-/* -- report viewer ---------------------------------------------------------- */
+.weight-sliders { margin-top: 8px; }
 
-#report-card {
-  display: flex;
-  flex-direction: column;
-  flex: 1 1 auto;
-  min-height: 420px;
+.weight-slider-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 10px;
+  margin: 12px 0;
 }
-#report-card[hidden] { display: none; }
+.weight-slider-row label {
+  grid-column: 1 / 3;
+  margin: 0;
+  font-weight: 500;
+  font-size: 12.5px;
+}
+.weight-slider-row input[type="range"] {
+  grid-column: 1 / 2;
+  width: 100%;
+  accent-color: var(--accent);
+}
+.weight-slider-val {
+  grid-column: 2 / 3;
+  font-variant-numeric: tabular-nums;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  min-width: 3.2em;
+  text-align: right;
+}
+
+/* -- report viewer ---------------------------------------------------------- */
 
 .report-toolbar {
   display: flex;
@@ -342,31 +527,33 @@ button.secondary:hover, a.secondary:hover { background: #eef4fa; }
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 8px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 .report-toolbar h2 { margin: 0; font-size: 15px; }
 
 #report-frame {
   width: 100%;
   flex: 1 1 auto;
-  min-height: 240px;
-  max-height: 46vh;
+  min-height: 0;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: white;
 }
+#report-frame[hidden] { display: none; }
 
-/* -- report Q&A chat, docked under the report -------------------------- */
+/* -- report Q&A chat, its own card in the left panel (not bundled with -- */
+/* the report strip at the bottom -- see #chat-panel in index.html)       */
 
 .chat-panel {
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-  min-height: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
 }
+.chat-panel[hidden] { display: none; }
 
 .chat-heading {
   margin: 0 0 8px;
@@ -428,6 +615,56 @@ button.secondary:hover, a.secondary:hover { background: #eef4fa; }
   border-color: var(--accent);
 }
 
+/* The mid-run feedback box (see main.js's "run_id"/interject handling) --
+   same look as the chat input row above, shown inline in the pipeline log
+   instead of its own panel since it's commenting on a run already in
+   progress, not asking a separate question about a finished one. */
+.interject-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+.interject-row[hidden] {
+  /* A plain "display:flex" class rule (any specificity) beats the
+     browser's own "[hidden]{display:none}" UA-stylesheet rule -- author
+     styles win over UA styles regardless of specificity. Without this,
+     setting .hidden=true in JS does nothing visible and the row stays on
+     screen. */
+  display: none;
+}
+.interject-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  background: white;
+}
+.interject-row input:focus {
+  outline: 2px solid #bcd6ee;
+  outline-offset: 0;
+  border-color: var(--accent);
+}
+
+/* The per-checkpoint countdown + Continue button (see main.js's
+   "checkpoint_open"/"checkpoint_close" handlers) -- sits right under the
+   feedback box, visible only while a checkpoint is actually open. */
+.checkpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+.checkpoint-row[hidden] {
+  display: none; /* same override as .interject-row[hidden] above */
+}
+.checkpoint-countdown {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 /* -- Leaflet legend on the persistent map ----------------------------------- */
 
 .webmap-legend {
@@ -466,6 +703,7 @@ button.secondary:hover, a.secondary:hover { background: #eef4fa; }
   }
   .place-row input,
   .chat-input-row input,
+  .interject-row input,
   .hint code {
     background: #1c1f24;
     color: var(--text);

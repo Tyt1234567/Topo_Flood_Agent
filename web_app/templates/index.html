@@ -10,51 +10,81 @@
 </head>
 <body>
 
-<div class="app-shell">
-  <aside class="left-panel">
-    <header class="left-header">
-      <h1>GeoAI Agent</h1>
-      <p class="header-subtitle">Flood risk &amp; drainage-demand, from a place name</p>
-    </header>
+<div class="app-root">
+  <div class="app-shell">
+    <aside class="left-panel">
+      <header class="left-header">
+        <h1>GeoAI Agent</h1>
+        <p class="header-subtitle">Flood risk &amp; drainage-demand, from a place name</p>
+      </header>
 
-    <div id="intro-card" class="card">
-      <p class="hint">Name a real place -- the agent geocodes it, streams the best available USGS/Open-Meteo
-        elevation data, runs a real discrete-Morse-theory (TTK) terrain analysis, ranks flood hotspots by a
-        Rational-Method drainage demand, and shows the result on the map. No coordinates or settings to fill in.</p>
-      <div class="place-row">
-        <input id="place-input" type="text" placeholder="e.g. College Park, MD" autofocus>
-        <button id="place-submit" class="primary">Analyze</button>
+      <div id="intro-card" class="card">
+        <p class="hint">Name a real place -- the agent geocodes it, streams the best available USGS/Open-Meteo
+          elevation data, runs a real discrete-Morse-theory (TTK) terrain analysis, ranks flood hotspots by a
+          Rational-Method drainage demand, and shows the result on the map. No coordinates or settings to fill in.</p>
+        <div class="place-row">
+          <input id="place-input" type="text" placeholder="e.g. College Park, MD" autofocus>
+          <button id="place-submit" class="primary">Analyze</button>
+        </div>
+        <div id="intro-status" class="status"></div>
+        <div class="objective-row">
+          <input id="objective-input" type="text" placeholder="Optional: what matters most here? e.g. protecting people's safety, or critical infrastructure">
+        </div>
+        <p class="hint draw-boundary-hint">Or skip the place name and
+          <button id="draw-boundary-btn" type="button" class="link-button">draw a custom boundary on the map</button>
+          instead -- anything typed above is used as its label.</p>
       </div>
-      <div id="intro-status" class="status"></div>
-    </div>
 
-    <div id="terminal-panel" class="terminal-panel" hidden>
-      <button id="terminal-toggle" class="terminal-toggle" type="button">
-        <span class="step-dot" id="terminal-dot"></span>
-        <span id="terminal-toggle-label">Agent analysis log</span>
-        <span class="chevron">&#9662;</span>
-      </button>
-      <div id="terminal-body" class="terminal-body">
-        <p class="hint" id="progress-place"></p>
-        <div id="progress-log" class="pipeline-steps"></div>
-        <div id="progress-error" class="warning-note" hidden></div>
-        <div class="button-row">
-          <button id="progress-retry" class="secondary" hidden>Try a different place</button>
+      <div id="terminal-panel" class="terminal-panel" hidden>
+        <button id="terminal-toggle" class="terminal-toggle" type="button">
+          <span class="step-dot" id="terminal-dot"></span>
+          <span id="terminal-toggle-label">Agent analysis log</span>
+          <span class="chevron">&#9662;</span>
+        </button>
+        <div id="terminal-body" class="terminal-body">
+          <p class="hint" id="progress-place"></p>
+          <div id="progress-log" class="pipeline-steps"></div>
+          <!-- Both this box and #checkpoint-row below are shown ONLY while a
+               checkpoint is actually open -- see main.js's openCheckpointUI/
+               closeCheckpointUI, driven by web_app/app.py's checkpoint_wait
+               emitting "checkpoint_open"/"checkpoint_close". The placeholder
+               here is overwritten per checkpoint (main.js's CHECKPOINT_
+               PROMPTS) -- persistence threshold, ranking & prioritization,
+               and the recommendation each get their own hint text. -->
+          <div id="interject-row" class="interject-row" hidden>
+            <input id="interject-input" type="text" placeholder="Have a comment on this step?">
+            <button id="interject-send" class="secondary">Send</button>
+          </div>
+          <p id="interject-status" class="hint" hidden></p>
+          <!-- Continue posts CONTINUE_SIGNAL via /api/agent/continue to skip
+               the rest of the 15s wait instead of typing feedback. The
+               countdown to its right auto-clicks Continue when it reaches
+               0 (main.js's openCheckpointUI) -- unless the user has clicked
+               into the feedback input, which freezes it until Continue is
+               clicked by hand (main.js's focus handler on #interject-input). -->
+          <div id="checkpoint-row" class="checkpoint-row" hidden>
+            <button id="checkpoint-continue" class="secondary">Continue</button>
+            <span id="checkpoint-countdown" class="checkpoint-countdown"></span>
+          </div>
+          <div id="progress-error" class="warning-note" hidden></div>
+          <div class="button-row">
+            <button id="progress-retry" class="secondary" hidden>Try a different place</button>
+          </div>
         </div>
       </div>
-    </div>
 
-    <div id="report-card" class="card" hidden>
-      <div class="report-toolbar">
-        <h2 id="report-title">Report</h2>
-        <div class="button-row">
-          <a id="report-download" class="secondary" download="flood-report.html">Download .html</a>
-          <button id="report-new" class="secondary">New place</button>
-        </div>
+      <!-- Same collapsible-toggle look as the analysis log above, but with no body of its
+           own -- clicking it just shows/hides #report-card, the report strip pinned to the
+           bottom of the page (see main.js's setReportPanelHidden). -->
+      <div id="report-toggle-panel" class="terminal-panel" hidden>
+        <button id="report-toggle" class="terminal-toggle" type="button">
+          <span class="step-dot"></span>
+          <span id="report-toggle-label">Report</span>
+          <span class="chevron">&#9662;</span>
+        </button>
       </div>
-      <iframe id="report-frame" title="Flood risk report"></iframe>
 
-      <div id="chat-panel" class="chat-panel">
+      <div id="chat-panel" class="chat-panel" hidden>
         <p class="chat-heading">Ask the agent about this analysis</p>
         <div id="chat-log" class="chat-log"></div>
         <div class="chat-input-row">
@@ -63,30 +93,63 @@
         </div>
         <div id="chat-status" class="status"></div>
       </div>
-    </div>
-  </aside>
+    </aside>
 
-  <main class="map-panel">
-    <div id="persistent-map"></div>
-    <div id="map-empty-state" class="map-empty-state">Run an analysis to see the terrain and flood hotspots here.</div>
-  </main>
+    <main class="map-panel">
+      <div id="persistent-map"></div>
+      <div id="map-empty-state" class="map-empty-state">Run an analysis to see the terrain and flood hotspots here.</div>
+    </main>
+  </div>
+
+  <!-- The report itself (not chat -- that's back in the left column above) is a floating,
+       draggable, resizable window (see main.js's initFloatingReportWindow) shown/hidden via
+       #report-toggle above, so the report's own coordinate links (report.py's _point_link ->
+       focusMapPoint) keep pointing at the SAME persistent map shown underneath rather than a
+       squeezed-in copy. -->
+  <section id="report-card" class="floating-window" hidden>
+    <div class="report-toolbar" id="report-drag-handle">
+      <h2 id="report-title">Report</h2>
+      <div class="button-row">
+        <a id="report-download" class="secondary" download="flood-report.html">Download .html</a>
+      </div>
+    </div>
+    <iframe id="report-frame" title="Flood risk report"></iframe>
+    <div id="report-resize-handle" class="floating-resize-handle" role="separator" aria-label="Resize report window"></div>
+  </section>
 </div>
 
-<!-- Exposure/population data popup: shown right after "Analyze" is clicked, before anything is fetched.
-     There is no live online source for this in the project, so the agent asks upfront rather than
-     pretending to search for it and failing -- skip leaves that risk factor at a neutral default. -->
-<div id="exposure-modal" class="modal-overlay" hidden>
+<!-- Modify-data popup: opened from a "Modify" button next to the elevation or exposure step in the
+     terminal panel's progress log, once that step's own run has finished -- lets the user supply their
+     own data for that layer and re-run the whole analysis with it substituted in. -->
+<div id="modify-data-modal" class="modal-overlay" hidden>
   <div class="modal">
-    <h3>Optional: population / exposure data</h3>
-    <p class="hint">Flood risk can optionally be weighted by how many people or structures are near each
-      hotspot. There's no live online source for this, so if you have a CSV (header <code>x,y,value</code>)
-      or shapefile (.zip with POINT geometry + a <code>value</code> field), attach it here. If not, this
-      factor is simply left out -- every other part of the analysis still runs normally.</p>
-    <label for="exposure-file">Exposure / population file (optional)</label>
-    <input id="exposure-file" type="file" accept=".csv,.zip,.shp">
+    <h3 id="modify-data-title">Upload your own data</h3>
+    <p class="hint" id="modify-data-hint"></p>
+    <label for="modify-data-file">File</label>
+    <input id="modify-data-file" type="file" accept=".csv,.zip,.shp,.tif,.tiff">
+    <div id="modify-data-status" class="status"></div>
     <div class="button-row">
-      <button id="exposure-continue" class="primary">Continue</button>
-      <button id="exposure-skip" class="secondary">Skip -- I don't have this</button>
+      <button id="modify-data-submit" class="primary">Modify &amp; re-run</button>
+      <button id="modify-data-cancel" class="secondary">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modify-weights popup: opened from the "Modify" button next to the "Flood ranking complete"
+     step, once that step's own run has finished -- lets the user hand-set the five risk-factor
+     weights (always summing to 100%) instead of the preset/entropy weighting, and re-runs the
+     whole analysis with those exact numbers substituted in. -->
+<div id="modify-weights-modal" class="modal-overlay" hidden>
+  <div class="modal">
+    <h3>Adjust risk-factor weights</h3>
+    <p class="hint">Drag a slider to change that factor's share of risk_score -- the other four
+      rescale automatically so they always sum to 100%. This replaces the preset/entropy weighting
+      with your own numbers for a full re-run.</p>
+    <div id="weight-sliders" class="weight-sliders"></div>
+    <div id="modify-weights-status" class="status"></div>
+    <div class="button-row">
+      <button id="modify-weights-submit" class="primary">Apply &amp; re-run</button>
+      <button id="modify-weights-cancel" class="secondary">Cancel</button>
     </div>
   </div>
 </div>
