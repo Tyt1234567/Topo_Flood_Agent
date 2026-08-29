@@ -1590,17 +1590,19 @@ def agent_analyze_stream():
                 return weight_preset_used  # unreachable (majority_id always comes from this same dict's values)
 
             yield from _rank_and_check()
-            yield from _aggregate_ead()
 
             # -- Interjection checkpoint 2/3: ranking & prioritization ------
-            # Loops back to Step 5 and cascades through Steps 6-8 again (see
-            # _rank_and_check/_aggregate_ead above) if the user comments on
-            # prioritization. A simple keyword match against the three
-            # named presets handles the common case of a user naming a
-            # philosophy in their own words ("life safety", "infrastructure");
-            # anything else still flows forward as extra context for the
-            # final recommendation even when it doesn't change which
-            # weights are used.
+            # Sits BEFORE the return-period aggregate (Step 8, below) by
+            # design -- see Figure 1 -- so feedback on the ranking/weighting
+            # itself lands before spending compute aggregating EAD against a
+            # ranking that's about to be redone. Loops back to Step 5 and
+            # cascades through Steps 6-7 again (see _rank_and_check above) if
+            # the user comments on prioritization. A simple keyword match
+            # against the three named presets handles the common case of a
+            # user naming a philosophy in their own words ("life safety",
+            # "infrastructure"); anything else still flows forward as extra
+            # context for the final recommendation even when it doesn't
+            # change which weights are used.
             feedback_holder: list = []
             yield from checkpoint_wait("ranking & prioritization", feedback_holder)
             if feedback_holder:
@@ -1615,7 +1617,8 @@ def agent_analyze_stream():
                 objective_text = f"{objective_text}\nUser feedback after seeing the ranking: {comment}".strip()
                 yield line({"type": "step", "label": "Re-ranking with the requested prioritization"})
                 yield from _rank_and_check()
-                yield from _aggregate_ead()
+
+            yield from _aggregate_ead()
 
             # -- Spatial analysis add-ons: OSM infrastructure proximity, real
             # pipe-capacity data (where loaded -- see load_dc_stormwater.py),
