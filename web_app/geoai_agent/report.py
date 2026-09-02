@@ -422,6 +422,24 @@ def _webmap_fragment(
           }},
         }});
       }}
+      // Pictorial marker for a single-point info layer (as opposed to the
+      // all-minima layer's plain circleMarkers, which encode real scalar
+      // data via size/color and shouldn't be replaced by an icon). An emoji
+      // glyph on a bordered badge reads as its own category at a glance
+      // instead of just another colored dot. Kept in sync with the live
+      // map's static/main.js emojiIcon().
+      function emojiIcon(emoji, borderColor) {{
+        return L.divIcon({{
+          className: 'emoji-marker-icon',
+          html: '<div style="width:24px;height:24px;border-radius:50%;background:#fff;border:2px solid ' + borderColor + ';' +
+            'display:flex;align-items:center;justify-content:center;font-size:13px;line-height:1;' +
+            'box-shadow:0 1px 3px rgba(0,0,0,0.45);">' + emoji + '</div>',
+          iconSize: [24, 24],
+          iconAnchor: [12, 12],
+          popupAnchor: [0, -12],
+        }});
+      }}
+
       if (gaugesData) {{
         // Real, current USGS NWIS river/stream gauge readings (geoai_agent/
         // streamflow.py) -- a fluvial-risk signal independent of this run's
@@ -429,7 +447,7 @@ def _webmap_fragment(
         // none nearby; that's the expected common case, not missing data.
         overlays['River/stream gauges (USGS NWIS)'] = L.geoJSON(gaugesData, {{
           pointToLayer: function(f, latlng) {{
-            return L.circleMarker(latlng, {{ radius: 7, weight: 1.5, color: '#12335c', fillColor: '#4a90d9', fillOpacity: 0.9 }});
+            return L.marker(latlng, {{ icon: emojiIcon('🌊', '#12335c') }});
           }},
           onEachFeature: function(f, layer) {{
             var p = f.properties;
@@ -494,10 +512,16 @@ def _webmap_fragment(
         // Design-storm intensity and dominant hydrologic soil group are
         // each a SINGLE value for the whole run (one storm, one dominant
         // group -- see rainfall.py/soil_data.py), not spatially varying, so
-        // this is one info marker rather than a coverage layer.
+        // this is one info marker rather than a coverage layer. Drawn as a
+        // rain-cloud emoji badge rather than a circle -- the all-minima
+        // layer below fills its circles with a viridis ramp that runs up to
+        // yellow, so a plain colored circleMarker here used to be
+        // indistinguishable from a high-drainage-demand minimum (or, with a
+        // blue badge, from a gauge) at a glance. Kept in sync with the live
+        // map's static/main.js populateMap().
         overlays['Rainfall & soil (NOAA / USDA)'] = L.geoJSON(rainfallSoilData, {{
           pointToLayer: function(f, latlng) {{
-            return L.circleMarker(latlng, {{ radius: 8, weight: 1.5, color: '#5c3a1e', fillColor: '#dcd939', fillOpacity: 0.9 }});
+            return L.marker(latlng, {{ icon: emojiIcon('🌧️', '#c2185b') }});
           }},
           onEachFeature: function(f, layer) {{
             var p = f.properties;
@@ -605,10 +629,14 @@ def _webmap_fragment(
           '<div style="display:flex;justify-content:space-between;font-size:10.5px;"><span>' +
           elevationLegend[0].value.toFixed(0) + ' m</span><span>' + elevationLegend[elevationLegend.length - 1].value.toFixed(0) + ' m</span></div>' : '';
         var allMinimaOn = layerIsVisible(overlays['All local minima (drainage demand)']);
+        var runoffGradientCss = [[0,[68,1,84]],[0.25,[59,82,139]],[0.5,[33,145,140]],[0.75,[94,201,98]],[1,[253,231,37]]]
+          .map(function(s) {{ return 'rgb(' + s[1][0] + ',' + s[1][1] + ',' + s[1][2] + ') ' + (s[0] * 100) + '%'; }}).join(', ');
         return '<div style="margin-bottom:6px;"><strong>Toggle layers above</strong> -- the legend below only shows what\\'s currently checked.</div>' +
           gradientHtml +
           (allMinimaOn ? '<div style="margin-top:6px;"><strong>Dot size</strong> = persistence (bigger = deeper basin)</div>' : '') +
           (allMinimaOn ? '<div><strong>Dot fill</strong> = drainage demand</div>' : '') +
+          (allMinimaOn ? '<div style="width:160px;height:8px;border-radius:2px;margin:3px 0;background:linear-gradient(90deg, ' + runoffGradientCss + ');"></div>' +
+            '<div style="display:flex;justify-content:space-between;font-size:10.5px;"><span>low</span><span>high</span></div>' : '') +
           (allMinimaOn ? '<div>Click a dot to highlight its catchment area</div>' : '') +
           (layerIsVisible(overlays['FEMA flood zones (NFHL)']) ?
             '<div style="margin-top:6px;"><strong>FEMA flood zones</strong></div>' +
@@ -622,7 +650,7 @@ def _webmap_fragment(
             : '') +
           (layerIsVisible(overlays['River/stream gauges (USGS NWIS)']) ?
             '<div style="margin-top:6px;"><strong>River/stream gauges</strong> (USGS NWIS, live)</div>' +
-            '<div><span style="display:inline-block;width:10px;height:10px;background:#4a90d9;border-radius:50%;border:1.5px solid #12335c;"></span> active gauge</div>'
+            '<div><span style="display:inline-block;width:16px;height:16px;border-radius:50%;background:#fff;border:1.5px solid #12335c;text-align:center;line-height:14px;font-size:9px;margin-right:3px;">🌊</span>active gauge -- click for details</div>'
             : '') +
           (buildingsData && highlightedCatchmentId !== null ?
             '<div style="margin-top:6px;"><span style="display:inline-block;width:10px;height:10px;background:#a8492c;border:1px solid #5c2414;"></span> buildings counted in the highlighted catchment (OpenStreetMap)</div>'
@@ -641,7 +669,8 @@ def _webmap_fragment(
             '<div style="margin-top:6px;"><strong>Roads / water</strong> (OpenStreetMap)</div>'
             : '') +
           (layerIsVisible(overlays['Rainfall & soil (NOAA / USDA)']) ?
-            '<div style="margin-top:6px;"><strong>Rainfall &amp; soil</strong> (NOAA Atlas 14 / USDA SSURGO -- click the marker)</div>'
+            '<div style="margin-top:6px;"><strong>Rainfall &amp; soil</strong> (NOAA Atlas 14 / USDA SSURGO)</div>' +
+            '<div><span style="display:inline-block;width:16px;height:16px;border-radius:50%;background:#fff;border:1.5px solid #c2185b;text-align:center;line-height:14px;font-size:9px;margin-right:3px;">🌧️</span>click for design-storm / soil details</div>'
             : '') +
           '<div id="webmap-catchment-clear" style="display:' + (highlightedCatchmentId === null ? 'none' : 'block') + ';margin-top:6px;"><a href="#" id="webmap-catchment-clear-link">Clear catchment highlight</a></div>';
       }}

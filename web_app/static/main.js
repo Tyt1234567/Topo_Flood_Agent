@@ -78,8 +78,9 @@ function initPersistentMap() {
 // viridis-ish ramp for the all-minima drainage-demand layer -- matches the
 // one embedded in the downloadable report (geoai_agent/report.py's
 // _webmap_fragment) so the two views read the same way.
+const RUNOFF_COLOR_STOPS = [[0, [68, 1, 84]], [0.25, [59, 82, 139]], [0.5, [33, 145, 140]], [0.75, [94, 201, 98]], [1, [253, 231, 37]]];
 function runoffColor(t) {
-  const stops = [[0, [68, 1, 84]], [0.25, [59, 82, 139]], [0.5, [33, 145, 140]], [0.75, [94, 201, 98]], [1, [253, 231, 37]]];
+  const stops = RUNOFF_COLOR_STOPS;
   for (let i = 0; i < stops.length - 1; i++) {
     const a = stops[i], b = stops[i + 1];
     if (t >= a[0] && t <= b[0]) {
@@ -91,6 +92,24 @@ function runoffColor(t) {
     }
   }
   return "rgb(253,231,37)";
+}
+
+// Pictorial marker for a single-point info layer (as opposed to the
+// all-minima layer's plain circleMarkers, which encode real scalar data via
+// size/color and shouldn't be replaced by an icon). An emoji glyph on a
+// bordered badge reads as a distinct "thing" at a glance instead of just
+// another colored dot -- no image asset/network fetch needed, and it
+// renders identically everywhere Leaflet already runs.
+function emojiIcon(emoji, borderColor) {
+  return L.divIcon({
+    className: "emoji-marker-icon",
+    html: `<div style="width:24px;height:24px;border-radius:50%;background:#fff;border:2px solid ${borderColor};` +
+      `display:flex;align-items:center;justify-content:center;font-size:13px;line-height:1;` +
+      `box-shadow:0 1px 3px rgba(0,0,0,0.45);">${emoji}</div>`,
+    iconSize: [24, 24],
+    iconAnchor: [12, 12],
+    popupAnchor: [0, -12],
+  });
 }
 
 function maxPersistence(featureCollection) {
@@ -285,7 +304,7 @@ function populateMap(mapData) {
   // same way.
   if (mapData.gauges_geojson) {
     mapLayers.gauges = L.geoJSON(mapData.gauges_geojson, {
-      pointToLayer: (f, latlng) => L.circleMarker(latlng, { radius: 7, weight: 1.5, color: "#12335c", fillColor: "#4a90d9", fillOpacity: 0.9 }),
+      pointToLayer: (f, latlng) => L.marker(latlng, { icon: emojiIcon("🌊", "#12335c") }),
       onEachFeature: (f, layer) => {
         const p = f.properties;
         layer.bindPopup(
@@ -373,9 +392,15 @@ function populateMap(mapData) {
   // SINGLE value for the whole run (one storm, one dominant soil group --
   // see rainfall.py/soil_data.py), not spatially varying, so this is one
   // info marker at the study area's center rather than a coverage layer.
+  // Drawn as a rain-cloud emoji badge rather than a circle -- the
+  // all-minima layer below fills its circles with a viridis ramp that runs
+  // all the way up to yellow, so a plain colored circleMarker here used to
+  // be visually indistinguishable from a high-drainage-demand minimum (or,
+  // with a blue badge, from a gauge) at a glance. A pictorial icon reads as
+  // its own category regardless of hue.
   if (mapData.rainfall_soil_geojson) {
     mapLayers.rainfallSoil = L.geoJSON(mapData.rainfall_soil_geojson, {
-      pointToLayer: (f, latlng) => L.circleMarker(latlng, { radius: 8, weight: 1.5, color: "#5c3a1e", fillColor: "#dcd939", fillOpacity: 0.9 }),
+      pointToLayer: (f, latlng) => L.marker(latlng, { icon: emojiIcon("🌧️", "#c2185b") }),
       onEachFeature: (f, layer) => {
         const p = f.properties;
         let html = `<b>Design storm</b><br>${p.design_storm_label}, 1-hour intensity: ${p.design_storm_intensity_mm_per_hr.toFixed(0)} mm/hr<br><small>${p.rainfall_source}</small>`;
@@ -447,12 +472,15 @@ function populateMap(mapData) {
         `<div style="display:flex;justify-content:space-between;font-size:10.5px;">` +
         `<span>${stops[0].value.toFixed(0)} m</span><span>${stops[stops.length - 1].value.toFixed(0)} m</span></div>`;
     }
+    const runoffGradientCss = RUNOFF_COLOR_STOPS.map((s) => `rgb(${s[1][0]},${s[1][1]},${s[1][2]}) ${s[0] * 100}%`).join(", ");
     return (
       `<div style="margin-bottom:6px;"><strong>Toggle layers above</strong> -- the legend below only shows what's currently checked.</div>` +
       gradientHtml +
       (layerIsVisible(mapLayers.allMinima)
         ? `<div style="margin-top:6px;"><strong>Dot size</strong> = persistence (bigger = deeper basin)</div>` +
           `<div><strong>Dot fill</strong> = drainage demand</div>` +
+          `<div style="width:160px;height:8px;border-radius:2px;margin:3px 0;background:linear-gradient(90deg, ${runoffGradientCss});"></div>` +
+          `<div style="display:flex;justify-content:space-between;font-size:10.5px;"><span>low</span><span>high</span></div>` +
           `<div>Click a dot -- or a point mentioned in the report -- to highlight its catchment area</div>`
         : "") +
       (layerIsVisible(mapLayers.femaFlood)
@@ -467,7 +495,7 @@ function populateMap(mapData) {
         : "") +
       (layerIsVisible(mapLayers.gauges)
         ? `<div style="margin-top:6px;"><strong>River/stream gauges</strong> (USGS NWIS, live)</div>` +
-          `<div><span style="display:inline-block;width:10px;height:10px;background:#4a90d9;border-radius:50%;border:1.5px solid #12335c;"></span> active gauge</div>`
+          `<div><span style="display:inline-block;width:16px;height:16px;border-radius:50%;background:#fff;border:1.5px solid #12335c;text-align:center;line-height:14px;font-size:9px;margin-right:3px;">🌊</span>active gauge -- click for details</div>`
         : "") +
       (layerIsVisible(mapLayers.buildings)
         ? `<div style="margin-top:6px;"><strong>Buildings</strong> (OpenStreetMap)</div>` +
@@ -487,7 +515,8 @@ function populateMap(mapData) {
         ? `<div style="margin-top:6px;"><strong>Roads / water</strong> (OpenStreetMap)</div>`
         : "") +
       (layerIsVisible(mapLayers.rainfallSoil)
-        ? `<div style="margin-top:6px;"><strong>Rainfall &amp; soil</strong> (NOAA Atlas 14 / USDA SSURGO -- click the marker)</div>`
+        ? `<div style="margin-top:6px;"><strong>Rainfall &amp; soil</strong> (NOAA Atlas 14 / USDA SSURGO)</div>` +
+          `<div><span style="display:inline-block;width:16px;height:16px;border-radius:50%;background:#fff;border:1.5px solid #c2185b;text-align:center;line-height:14px;font-size:9px;margin-right:3px;">🌧️</span>click for design-storm / soil details</div>`
         : "") +
       `<div id="catchment-clear-row"${currentHighlightedCatchmentId === null ? " hidden" : ""}><a href="#" id="catchment-clear-link">Clear catchment highlight</a></div>`
     );
