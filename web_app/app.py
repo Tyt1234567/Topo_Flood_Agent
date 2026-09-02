@@ -37,7 +37,9 @@ APP_DIR = Path(__file__).resolve().parent
 
 from dotenv import load_dotenv
 
-load_dotenv()  # picks up DATABASE_URL from the project root's .env (see geoai_agent/drainage_db.py)
+load_dotenv(override=True)  # .env (see .env.example) is the documented place to set these --
+# override=True so it actually wins over a stray same-named system/shell env var instead of
+# being silently ignored (python-dotenv's default is override=False)
 
 from flask import Flask, Response, jsonify, render_template, request
 
