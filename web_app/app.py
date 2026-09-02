@@ -2299,6 +2299,69 @@ def agent_analyze_stream():
 # server-side session to expire or leak between users.
 
 _QA_HISTORY_TURNS_KEPT = 6  # most-recent turns resent for context, not the whole thread
+# Default row count for "all_minima_full.entries" when a question doesn't
+# need row-level enumeration (see _question_needs_minima_enumeration below)
+# -- small enough to keep the common-case prompt light, big enough that the
+# model still has real per-basin data to point to if it wants an example.
+_QA_MINIMA_SAMPLE_DEFAULT = 25
+
+# Words/phrases that signal a question actually needs to filter, count, or
+# list over the full raw-minima table rather than just reasoning about the
+# already-short "hotspots" shortlist. Deliberately broad/over-inclusive --
+# a false positive here just means an unnecessarily large prompt (the
+# previous, always-on behavior), while a false negative means a genuine
+# "list/count" question silently gets an incomplete answer, which is worse.
+_MINIMA_ENUMERATION_HINTS = (
+    "how many", "count", "list", "enumerate", "every basin", "every minim",
+    "all basins", "all minima", "all local minima", "which basins", "which minima",
+    "filter", "greater than", "less than", "more than", "at least", "at most",
+    "over ", "under ", "above ", "below ", "between ",
+)
+
+
+def _question_needs_minima_enumeration(question: str) -> bool:
+    q = question.lower()
+    return any(hint in q for hint in _MINIMA_ENUMERATION_HINTS)
+
+
+def _trim_minima_for_question(context: dict, question: str) -> None:
+    """Mutates context in place: unless the question looks like it needs
+    to filter/count/list over the raw-minima table, shrink
+    "all_minima_full.entries" down to a small sample instead of resending
+    every raw minimum (up to _QA_ALL_MINIMA_CAP=500 rows) on every single
+    question.
+
+    Root-caused a live 504 DEADLINE_EXCEEDED on a plain "which hotspot
+    needs attention first, and why?" question -- a question the system
+    prompt itself says should be answered from "hotspots" (already a short,
+    ranked list), not "all_minima_full". The full 500-row dump was being
+    attached regardless, making an unrelated question's prompt large enough
+    to occasionally exceed Gemini's own generation deadline. The already-
+    documented "truncated"/"cutoff_note" fields exist precisely to tell the
+    model a list is incomplete, so reuse them here rather than inventing a
+    parallel mechanism.
+    """
+    full = context.get("all_minima_full")
+    if not isinstance(full, dict) or full.get("truncated"):
+        return  # already short, or already marked incomplete -- leave as-is
+    entries = full.get("entries")
+    if not isinstance(entries, list) or len(entries) <= _QA_MINIMA_SAMPLE_DEFAULT:
+        return
+    if _question_needs_minima_enumeration(question):
+        return
+
+    total = full.get("total_raw_minima", len(entries))
+    sample = entries[:_QA_MINIMA_SAMPLE_DEFAULT]
+    full["entries"] = sample
+    full["included_count"] = len(sample)
+    full["truncated"] = True
+    full["cutoff_note"] = (
+        f"Only the {len(sample)} most persistent raw minima (of {total} total) are included below -- "
+        "trimmed for this question since it didn't ask to filter/count/list basins. If the reviewer's "
+        "question actually needs the complete raw-minima table, say so plainly rather than presenting "
+        "this sample as the whole picture; a follow-up question phrased as a filter/count/list will "
+        "receive the full table."
+    )
 
 
 def _friendly_llm_error(exc: Exception) -> str:
@@ -2314,6 +2377,11 @@ def _friendly_llm_error(exc: Exception) -> str:
         return (
             "Gemini's free-tier daily quota (20 requests/day) is used up for now -- "
             "this resets on its own, try again later."
+        )
+    if "DEADLINE_EXCEEDED" in text or "504" in text:
+        return (
+            "Gemini took too long to respond (it hit its own generation deadline) -- "
+            "this is usually transient, please try asking again."
         )
     return f"LLM request failed: {text}"
 
@@ -2332,6 +2400,8 @@ def agent_ask():
         history = json.loads(request.form.get("history", "[]"))
     except json.JSONDecodeError:
         history = []
+
+    _trim_minima_for_question(context, question)
 
     history_text = "".join(
         f"\n{turn.get('role', 'user').upper()}: {turn.get('content', '')}"
