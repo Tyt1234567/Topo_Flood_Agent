@@ -395,13 +395,14 @@ def realworld_analyze():
                 live_source = _describe_elevation_source(elevation_source)
             else:
                 live_source = "the live Open-Meteo API (not pre-downloaded or cached)"
+            trimmed_morse_result, morse_result_note = _trim_morse_result_for_prompt(results[primary_variable])
             context = (
                 f"'{primary_variable}' data for this run came from {live_source}. Basins/peaks were "
                 "computed by TTK (Topology ToolKit)'s Morse-Smale complex: persistence-based "
                 "topological simplification at the reported threshold, then critical points and "
                 "descending/ascending manifolds (basins/peak catchments) on the simplified field -- "
                 "no heuristic depression-filling or breaching preprocessing.\n"
-                f"Morse analysis result: {json.dumps(results[primary_variable], ensure_ascii=False)}"
+                f"Morse analysis result: {json.dumps(trimmed_morse_result, ensure_ascii=False)}{morse_result_note}"
             )
             if layer_descriptions:
                 context += (
@@ -699,6 +700,179 @@ _AGENT_ALL_MINIMA_THRESHOLD = 1e-6
 # for runs with an unusually large grid (thousands of raw minima). Ordinary
 # runs (hundreds of minima) fit under this easily and get every one.
 _QA_ALL_MINIMA_CAP = 500
+# Cap on how many significant-basin hotspots (and EAD per-basin entries) are
+# serialized in full into the recommendation-writing prompt (see
+# _build_user_context below). A run with ~70 significant basins, each
+# carrying ~20 fields (five per-factor scores, runoff coefficient+source,
+# FEMA/gauge/TWI/building-exposure tags, EAD per-return-period breakdown),
+# was observed directly to push generation past 150s on every one of 3
+# attempts ("The read operation timed out" on all of them, not a 504 from
+# Google -- genuinely slow generation, not a hang/quota issue), and even
+# after trimming to 15 a real run's generation still took 176-480s -- content
+# complexity, not just character count, drives generation time here. The
+# recommendation only ever needs to discuss a handful of hotspots in depth
+# regardless of how many significant basins a run finds, so only the top
+# N by risk_score are sent in full; the rest are summarized in one line.
+# Lowered 15 -> 8 to cut real generation time further, not just guard
+# against an extreme-case timeout.
+_RECOMMENDATION_TOP_N_HOTSPOTS = 8
+# Fields dropped from each hotspot before it's serialized into the prompt --
+# pure internal bookkeeping (grid_index/catchment_id/map_catchment_id are
+# used only for raster indexing and the report's own clickable point-links;
+# within_boundary is a pre-filter already applied before hotspots ever reach
+# this function) plus a batch of per-hotspot fields FLOOD_RECOMMENDATION_
+# SYSTEM never actually asks the model to read, cite, or discuss at all
+# (aspect/local_relief/flow_length are terrain metrics only the map/report
+# renders; nearby_pipe_count/nearby_pipe_capacity_m3s are drainage-capacity
+# tags the system prompt's field-by-field schema doesn't mention) -- pure
+# wasted tokens on every one of the top-N hotspots.
+_RECOMMENDATION_DROP_HOTSPOT_FIELDS = (
+    "grid_index", "catchment_id", "map_catchment_id", "within_boundary",
+    "aspect_deg", "aspect_compass", "local_relief_m", "flow_length_m",
+    "nearby_pipe_count", "nearby_pipe_capacity_m3s",
+)
+
+
+def _round_floats_for_prompt(obj, ndigits: int = 3):
+    """Recursively round every float in obj to ndigits decimal places.
+    Raw float64 JSON ("0.8234061726592786") burns far more prompt tokens
+    than the recommendation's plain-language narrative needs ("0.823") --
+    applied across every per-factor score/coordinate/runoff figure in every
+    hotspot, this is a meaningful size cut for free (no information the
+    system prompt asks the model to reason about needs 4th-decimal-place
+    precision)."""
+    if isinstance(obj, float):
+        return round(obj, ndigits)
+    if isinstance(obj, dict):
+        return {k: _round_floats_for_prompt(v, ndigits) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_round_floats_for_prompt(v, ndigits) for v in obj]
+    return obj
+
+
+def _trim_flood_result_for_prompt(flood_result: dict) -> tuple[dict, str]:
+    """Returns (a copy of flood_result with only the top
+    _RECOMMENDATION_TOP_N_HOTSPOTS hotspots by risk_score, each stripped of
+    _RECOMMENDATION_DROP_HOTSPOT_FIELDS and float-rounded, plus a one-line
+    note describing what was cut, or "" if nothing was) for embedding in
+    the recommendation prompt. Most runs' significant-basin count never
+    exceeds the cap, but the field-stripping/rounding always applies --
+    it's pure bookkeeping either way."""
+    hotspots = flood_result.get("hotspots") or []
+    trimmed_hotspots = [
+        _round_floats_for_prompt({k: v for k, v in h.items() if k not in _RECOMMENDATION_DROP_HOTSPOT_FIELDS})
+        for h in hotspots
+    ]
+    if len(hotspots) <= _RECOMMENDATION_TOP_N_HOTSPOTS:
+        return {**flood_result, "hotspots": trimmed_hotspots}, ""
+    top = trimmed_hotspots[:_RECOMMENDATION_TOP_N_HOTSPOTS]
+    tail_scores = [h["risk_score"] for h in hotspots[_RECOMMENDATION_TOP_N_HOTSPOTS:] if h.get("risk_score") is not None]
+    note = (
+        f" (Showing the top {_RECOMMENDATION_TOP_N_HOTSPOTS} of {len(hotspots)} significant basins by "
+        f"risk_score in full above; the remaining {len(hotspots) - _RECOMMENDATION_TOP_N_HOTSPOTS} range from "
+        f"risk_score {max(tail_scores):.3f} down to {min(tail_scores):.3f}.)"
+        if tail_scores else
+        f" (Showing the top {_RECOMMENDATION_TOP_N_HOTSPOTS} of {len(hotspots)} significant basins by risk_score.)"
+    )
+    return {**flood_result, "hotspots": top}, note
+
+
+def _trim_ead_result_for_prompt(ead_result: dict | None) -> tuple[dict | None, str]:
+    """Same idea as _trim_flood_result_for_prompt, for the EAD
+    aggregation's own per-basin "basins" list. Drops each basin's
+    "per_scenario" breakdown (6 return-period figures) and internal
+    bookkeeping IDs unconditionally -- the recommendation only ever needs
+    coords + the already-aggregated expected_annual_runoff_m3s total, never
+    the per-storm detail or catchment/grid identity behind it -- rounds the
+    remaining floats, and caps the list to the top N by that total, same as
+    the hotspots list above."""
+    if not ead_result:
+        return ead_result, ""
+    basins = ead_result.get("basins") or []
+    slim_basins = [
+        _round_floats_for_prompt({k: v for k, v in b.items() if k not in ("per_scenario", "grid_index", "catchment_id")})
+        for b in basins
+    ]
+    if len(basins) <= _RECOMMENDATION_TOP_N_HOTSPOTS:
+        return {**ead_result, "basins": slim_basins}, ""
+    ranked = sorted(slim_basins, key=lambda b: b.get("expected_annual_runoff_m3s") or 0, reverse=True)
+    top = ranked[:_RECOMMENDATION_TOP_N_HOTSPOTS]
+    note = (
+        f" (Showing the top {_RECOMMENDATION_TOP_N_HOTSPOTS} of {len(basins)} basins by "
+        "expected annual runoff in full above.)"
+    )
+    return {**ead_result, "basins": top}, note
+
+
+# Fields dropped anywhere they appear in a raw analyze_scalar_field_ttk()
+# result before it's serialized into the Smart-Query MORSE_RECOMMENDATION_
+# SYSTEM prompt (see realworld_analyze() below). "descending_manifold" is a
+# FULL (ny x nx) raster of catchment-membership ints -- tens of thousands of
+# numbers for an ordinary grid -- and "separatrices" is polyline map-render
+# geometry; MORSE_RECOMMENDATION_SYSTEM never mentions either one, they
+# exist purely for the map layer. "grid_index"/"multiplicity"/"catchment_id"
+# are per-point raster bookkeeping the prompt doesn't reference either
+# (coords/value/persistence/significant are what it actually reads).
+_MORSE_PROMPT_DROP_KEYS = frozenset({
+    "descending_manifold", "separatrices", "grid_index", "multiplicity", "catchment_id",
+})
+# Cap on how many NON-significant (noise) entries per critical_points/
+# basins/peak_basins list are kept in the prompt -- every significant entry
+# is always kept in full (that's the actual finding), but a large grid can
+# have thousands of sub-threshold minima/maxima/saddles, and the system
+# prompt only ever needs a representative sample of "here's what got
+# filtered out as noise and why", not literally every single one.
+_MORSE_PROMPT_MAX_NONSIGNIFICANT = 40
+
+
+def _strip_keys_for_prompt(obj):
+    """Recursively drop every key in _MORSE_PROMPT_DROP_KEYS, at any nesting
+    depth, from obj."""
+    if isinstance(obj, dict):
+        return {k: _strip_keys_for_prompt(v) for k, v in obj.items() if k not in _MORSE_PROMPT_DROP_KEYS}
+    if isinstance(obj, list):
+        return [_strip_keys_for_prompt(v) for v in obj]
+    return obj
+
+
+def _cap_nonsignificant(points: list) -> tuple[list, int]:
+    """Keep every entry with significant=True, plus up to
+    _MORSE_PROMPT_MAX_NONSIGNIFICANT of the rest; returns (kept, num_dropped)."""
+    significant = [p for p in points if p.get("significant")]
+    non_significant = [p for p in points if not p.get("significant")]
+    kept_non_sig = non_significant[:_MORSE_PROMPT_MAX_NONSIGNIFICANT]
+    return significant + kept_non_sig, len(non_significant) - len(kept_non_sig)
+
+
+def _trim_morse_result_for_prompt(morse_result: dict) -> tuple[dict, str]:
+    """Returns (a copy of a raw analyze_scalar_field_ttk() result stripped
+    of map-only geometry/bookkeeping and capped to a representative sample
+    of noise points, plus a one-line note describing what was cut, or "" if
+    nothing was) for embedding in the Smart-Query recommendation prompt.
+    This is the single biggest offender for that prompt's size --
+    descending_manifold alone is a full raster, tens of thousands of numbers
+    for an ordinary grid, that the LLM never reads."""
+    trimmed = _strip_keys_for_prompt(morse_result)
+    dropped_notes = []
+    cp = trimmed.get("critical_points") or {}
+    for kind in ("minimum", "maximum", "saddle"):
+        if kind in cp:
+            cp[kind], n_dropped = _cap_nonsignificant(cp[kind])
+            if n_dropped:
+                dropped_notes.append(f"{n_dropped} non-significant {kind} points")
+    for basin_key in ("basins", "peak_basins"):
+        if basin_key in trimmed:
+            entries = trimmed[basin_key]
+            significant = [e for e in entries if e.get("significant")]
+            if len(significant) < len(entries):
+                trimmed[basin_key] = significant
+                dropped_notes.append(f"{len(entries) - len(significant)} non-significant entries from \"{basin_key}\"")
+    trimmed = _round_floats_for_prompt(trimmed)
+    note = (
+        f" (Omitted for brevity: {'; '.join(dropped_notes)}; every significant point/basin is included in full above.)"
+        if dropped_notes else ""
+    )
+    return trimmed, note
 
 # How many seconds each of agent_analyze_stream's three checkpoints waits
 # for a user interjection before continuing automatically. Fixed and short
@@ -1905,6 +2079,8 @@ def agent_analyze_stream():
                         f"Morse-significant basins ({morse_vs_d8['num_raw_morse_minima']} raw Morse minima before "
                         f"persistence filtering); {sink_agreement_text}; {correlation_text}."
                     )
+                flood_result_for_prompt, flood_result_note = _trim_flood_result_for_prompt(flood_result)
+                ead_result_for_prompt, ead_result_note = _trim_ead_result_for_prompt(ead_result)
                 user_context = (
                 f"'elevation' data for this run came from {live_source}. Basins/peaks were computed by "
                 "TTK (Topology ToolKit)'s Morse-Smale complex: persistence-based topological simplification "
@@ -1923,21 +2099,21 @@ def agent_analyze_stream():
                 f"Exposure layer available: {exposure_field is not None} (source: {exposure_source}). "
                 f"Land cover data available: {land_cover_grid is not None}. Soil data available: {hydrologic_group is not None}"
                 f"{f' ({hydrologic_group})' if hydrologic_group else ''}.\n"
-                f"Flood risk ranking result: {json.dumps(flood_result, ensure_ascii=False)}"
+                f"Flood risk ranking result: {json.dumps(flood_result_for_prompt, ensure_ascii=False)}{flood_result_note}"
                 + (f"\nExpected-annual-runoff aggregation (all six return periods combined): "
-                   f"{json.dumps(ead_result, ensure_ascii=False)}" if ead_result else
+                   f"{json.dumps(ead_result_for_prompt, ensure_ascii=False)}{ead_result_note}" if ead_result else
                    "\nExpected-annual-runoff aggregation was not computed for this run.")
                 + (f"\nAgent's own analysis-strategy decision (why this run used the "
                    f"'{strategy_decision['weight_preset']}' weighting preset): {strategy_decision['reasoning']}"
                    if strategy_decision else "")
                 + (f"\nAgent's own persistence-threshold decision (why this run used a "
                    f"{threshold_decision['chosen_threshold']:.2f}m threshold out of the candidates "
-                   f"{json.dumps(threshold_decision['candidates'], ensure_ascii=False)}): {threshold_decision['reasoning']}"
+                   f"{json.dumps(_round_floats_for_prompt(threshold_decision['candidates']), ensure_ascii=False)}): {threshold_decision['reasoning']}"
                    if threshold_decision else "")
                 + (f"\nAgent's own weight-sensitivity check across balanced/life_safety/infrastructure_"
                    f"protection/entropy weighting schemes: "
                    f"{'the #1-ranked basin is STABLE across every scheme tested' if weight_sensitivity['rank1_stable_across_schemes'] else 'the #1-ranked basin CHANGES depending on which scheme is used -- treat the top pick as sensitive to prioritization philosophy'}. "
-                   f"Full per-scheme result: {json.dumps(weight_sensitivity['per_scheme'], ensure_ascii=False)}"
+                   f"Full per-scheme result: {json.dumps(_round_floats_for_prompt(weight_sensitivity['per_scheme']), ensure_ascii=False)}"
                    if weight_sensitivity else "\nWeight-sensitivity check was not computed for this run.")
                 + morse_vs_d8_note
                 + ("\nWhen writing the recommendation below, reference the agent's own strategy/threshold "
@@ -1962,7 +2138,10 @@ def agent_analyze_stream():
 
             def _generate_and_reflect():
                 nonlocal llm, model_name, recommendation, reflection
-                yield line({"type": "step", "label": "Generating recommendation (LLM)"})
+                yield line({"type": "step", "label": "Generating recommendation (LLM)", "detail": {
+                    "prompt_chars": len(user_context) if user_context else 0,
+                    "system_prompt_chars": len(system_prompt),
+                }})
                 t0 = time.time()
                 try:
                     llm = LLMClient()
