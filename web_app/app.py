@@ -64,13 +64,21 @@ from geoai_agent.drainage_db import fetch_nearby_pipes, pipes_to_geojson, tag_ho
 from geoai_agent.fema_flood import fetch_fema_flood_zones, tag_hotspots_with_flood_zone
 from geoai_agent.social_vulnerability import fetch_social_vulnerability_zones, tag_hotspots_with_svi
 from geoai_agent.flood_tools import (
+    CN_TABLE,
+    CN_TABLE_GLOBAL,
     RAINFALL_SCENARIOS,
     WEIGHT_PRESETS,
     compute_expected_annual_runoff,
     rank_flood_basins,
 )
 from geoai_agent.interjection import CONTINUE_SIGNAL, HOLD_SIGNAL, post_interjection, take_interjection
-from geoai_agent.land_cover import fetch_nlcd_landcover_grid, land_cover_geojson
+from geoai_agent.land_cover import (
+    NLCD_CLASS_INFO,
+    GLOBAL_LANDCOVER_CLASS_INFO,
+    fetch_global_landcover_grid,
+    fetch_nlcd_landcover_grid,
+    land_cover_geojson,
+)
 from geoai_agent.llm_client import LLMClient
 from geoai_agent.report import all_minima_geojson, elevation_hillshade_geojson, render_flood_report_html, terrain_legend_stops
 from geoai_agent.flow_field import flow_field_geojson
@@ -89,10 +97,12 @@ from geoai_agent.spatial_analysis import (
 from geoai_agent.streamflow import fetch_nearby_river_gauges, gauges_to_geojson, tag_hotspots_with_river_gauge
 from geoai_agent.ttk_engine import analyze_scalar_field_ttk
 from geoai_agent.real_data import (
+    MAX_GRID_RESOLUTION as _OPEN_METEO_MAX_GRID_RESOLUTION,
     MAX_USGS_GRID_RESOLUTION,
     OPEN_METEO_VARIABLES,
     bounding_box_around_point,
     build_real_world_dataset,
+    fetch_global_population_density_field,
     fetch_population_exposure_field,
     geocode_place,
     ground_spacing_meters,
@@ -1287,8 +1297,23 @@ def agent_analyze_stream():
             # later, right before they were tagged onto ranked hotspots) --
             # the raw fetch only ever needed `bounds`, never the ranking
             # that comes later; only the per-hotspot TAGGING has to wait.
+            # _AGENT_MAX_GRID_RESOLUTION (500) is only safe for the fast,
+            # uncapped USGS 3DEP DEM COG path (continental US, GDAL-windowed
+            # read of a source GeoTIFF -- no point-count cost at all).
+            # Outside the continental US, elevation falls back to Open-Meteo
+            # -- a per-point-batched, per-minute-rate-limited API real_data.
+            # py itself only ever tested/tuned up to MAX_GRID_RESOLUTION (80,
+            # imported here as _OPEN_METEO_MAX_GRID_RESOLUTION) -- checked
+            # directly: a 500-cap grid over a non-US city never completed a
+            # single elevation fetch in over 90s, even before hitting a real
+            # rate limit. Capping the resolution request itself, not just
+            # hoping the retry/backoff logic absorbs it, is what actually
+            # keeps a non-US run inside a reasonable wall-clock time.
+            agent_max_grid_resolution = (
+                _AGENT_MAX_GRID_RESOLUTION if is_in_continental_us(bounds) else _OPEN_METEO_MAX_GRID_RESOLUTION
+            )
             resolution = resolution_for_target_spacing_scaled(
-                bounds, target_resolution_meters, max_resolution=_AGENT_MAX_GRID_RESOLUTION,
+                bounds, target_resolution_meters, max_resolution=agent_max_grid_resolution,
             )
             lat_min0, lat_max0, lon_min0, lon_max0 = bounds
 
@@ -1343,12 +1368,18 @@ def agent_analyze_stream():
                 # factor works out of the box for any US location instead of
                 # only ever working when a user happens to have their own
                 # file (see real_data.fetch_population_exposure_field). Any
-                # failure here (non-US location, service unavailable) must
-                # degrade to the exact same neutral-default message this
-                # branch already gave before this fetch existed -- never a
-                # hard failure for the whole run.
+                # failure here (most commonly just "outside US coverage") now
+                # falls through to WorldPop's global 100m density layer
+                # (real_data.fetch_global_population_density_field) instead
+                # of going straight to the flat neutral default -- same
+                # "coarser but real beats none at all" fallback this run's
+                # land cover already applies (NLCD -> global Sentinel-2).
                 try:
                     return "census_live", fetch_population_exposure_field(bounds, resolution), None
+                except Exception:
+                    pass
+                try:
+                    return "worldpop_global", fetch_global_population_density_field(bounds, resolution), None
                 except Exception as exc:
                     return None, None, exc
 
@@ -1399,23 +1430,55 @@ def agent_analyze_stream():
                 # why) -- still overlaps with whatever of the batch above
                 # hasn't finished yet, rather than running fully serial
                 # after it.
-                fut_landcover = pool.submit(fetch_nlcd_landcover_grid, bounds, resolution=elevation_field.shape[::-1])
+                def _fetch_landcover():
+                    # NLCD first (purpose-built, validated, US+territories
+                    # only); on ANY failure -- most commonly just "outside
+                    # NLCD's coverage" -- fall back to the coarser global
+                    # Sentinel-2 10m classifier (land_cover.
+                    # fetch_global_landcover_grid) instead of going straight
+                    # to "no land cover data at all," so a non-US study area
+                    # still gets a real (if coarser) land-cover-derived
+                    # runoff coefficient rather than only ever the flat
+                    # default. Returns (grid, source) or raises if BOTH fail.
+                    try:
+                        return fetch_nlcd_landcover_grid(bounds, resolution=elevation_field.shape[::-1]), "nlcd"
+                    except Exception:
+                        return fetch_global_landcover_grid(bounds, resolution=elevation_field.shape[::-1]), "global_sentinel2"
+
+                fut_landcover = pool.submit(_fetch_landcover)
 
                 fema_flood_geojson = fut_fema.result()
                 svi_geojson = fut_svi.result()
                 rainfall_table = fut_rainfall.result()
                 hydrologic_group = fut_soil.result()
+                hydrologic_group_source = "measured" if hydrologic_group else None
                 exposure_source, exposure_field, exposure_exc = fut_exposure.result()
                 nearby_pipes = fut_pipes.result()
                 river_gauges = fut_gauges.result()
                 osm_infra = fut_infra.result()
                 try:
-                    land_cover_grid = fut_landcover.result()
+                    land_cover_grid, land_cover_source = fut_landcover.result()
                 except Exception as exc:
                     land_cover_grid = None
+                    land_cover_source = None
                     yield line({"type": "step", "label": "No land cover data available -- runoff coefficient will use the flat default", "detail": {"error": str(exc)}})
                 else:
-                    yield line({"type": "step", "label": "Land cover data loaded (NLCD)"})
+                    yield line({"type": "step", "label": f"Land cover data loaded ({'NLCD' if land_cover_source == 'nlcd' else 'global Sentinel-2, NLCD unavailable here'})"})
+                    # SSURGO (fetch_dominant_hydrologic_soil_group) is
+                    # US-only, same as NLCD -- if land cover succeeded only
+                    # via the global fallback and no real soil measurement
+                    # exists either, default to "B" (moderate infiltration,
+                    # a documented middle-of-the-road NRCS engineering
+                    # assumption when no site-specific survey is available)
+                    # rather than silently falling all the way back to the
+                    # flat runoff_coefficient constant -- clearly labeled as
+                    # an assumption, not measured data, everywhere it's
+                    # surfaced (see hydrologic_group_source below).
+                    if land_cover_source == "global_sentinel2" and not hydrologic_group:
+                        hydrologic_group = "B"
+                        hydrologic_group_source = "assumed_default"
+                land_cover_cn_table = CN_TABLE_GLOBAL if land_cover_source == "global_sentinel2" else CN_TABLE
+                land_cover_class_info = GLOBAL_LANDCOVER_CLASS_INFO if land_cover_source == "global_sentinel2" else NLCD_CLASS_INFO
 
             # Clipped to the real boundary, not left as the padded rectangular
             # bbox FEMA was actually queried over -- same reasoning as every
@@ -1459,6 +1522,7 @@ def agent_analyze_stream():
             if exposure_field is not None:
                 yield line({"type": "step", "label": (
                     "Exposure data loaded" if exposure_source == "user_upload"
+                    else "Population/exposure data loaded (WorldPop global 100m, US Census unavailable here)" if exposure_source == "worldpop_global"
                     else "Population/exposure data loaded (US Census block groups)"
                 )})
             elif exposure_tmp_path:
@@ -1666,6 +1730,7 @@ def agent_analyze_stream():
                     weights=weight_preset_used, runoff_coefficient=_AGENT_RUNOFF_COEFFICIENT,
                     slope_field=slope_field, exposure_field=exposure_field, boundary_mask=boundary_mask,
                     land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
+                    land_cover_cn_table=land_cover_cn_table,
                 )
                 if boundary is not None:
                     tag_hotspots_within_boundary(flood_result["hotspots"], boundary["polygon"])
@@ -1734,6 +1799,7 @@ def agent_analyze_stream():
                         rainfall_table=rainfall_table, runoff_coefficient=_AGENT_RUNOFF_COEFFICIENT,
                         slope_field=slope_field, exposure_field=exposure_field, boundary_mask=boundary_mask,
                         land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
+                        land_cover_cn_table=land_cover_cn_table,
                     )
                     yield line({
                         "type": "agent_decision", "decision": "weight_sensitivity",
@@ -1779,6 +1845,7 @@ def agent_analyze_stream():
                         elevation_field, morse_result, rainfall_table=rainfall_table, weights=weight_preset_used,
                         runoff_coefficient=_AGENT_RUNOFF_COEFFICIENT, slope_field=slope_field, exposure_field=exposure_field,
                         boundary_mask=boundary_mask, land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
+                        land_cover_cn_table=land_cover_cn_table,
                     )
                     ead_by_catchment = {b["catchment_id"]: b["expected_annual_runoff_m3s"] for b in ead_result["basins"]}
                     for h in flood_result["hotspots"]:
@@ -2000,7 +2067,8 @@ def agent_analyze_stream():
                 exposure_geojson_data = clip_geojson_to_polygon(exposure_geojson_data, boundary["polygon"])
 
             land_cover_geojson_data = (
-                land_cover_geojson(elevation_field, land_cover_grid) if land_cover_grid is not None else None
+                land_cover_geojson(elevation_field, land_cover_grid, class_info=land_cover_class_info)
+                if land_cover_grid is not None else None
             )
             if land_cover_geojson_data and boundary is not None:
                 land_cover_geojson_data = clip_geojson_to_polygon(land_cover_geojson_data, boundary["polygon"])
@@ -2066,6 +2134,7 @@ def agent_analyze_stream():
                     weights=weight_preset_used, runoff_coefficient=_AGENT_RUNOFF_COEFFICIENT,
                     slope_field=slope_field, exposure_field=exposure_field, boundary_mask=boundary_mask,
                     land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
+                    land_cover_cn_table=land_cover_cn_table,
                 )
                 all_minima_hotspots = flood_result_all["hotspots"]
                 if boundary is not None:
@@ -2495,7 +2564,9 @@ def agent_analyze_stream():
                 river_gauge_data_available=bool(river_gauges),
                 exposure_source=exposure_source,
                 land_cover_data_available=land_cover_grid is not None,
+                land_cover_source=land_cover_source,
                 soil_data_available=hydrologic_group is not None,
+                hydrologic_group_source=hydrologic_group_source,
                 expected_annual_runoff=ead_result,
                 strategy_decision=strategy_decision,
                 threshold_decision=threshold_decision,

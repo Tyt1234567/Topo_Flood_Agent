@@ -180,23 +180,53 @@ CN_TABLE = {
     95: {"A": 30, "B": 30, "C": 30, "D": 30},       # Emergent Herbaceous Wetlands
 }
 
+# Same idea as CN_TABLE above, for geoai_agent.land_cover.
+# fetch_global_landcover_grid's class codes (Esri/Impact Observatory's
+# global Sentinel-2 10m Land Cover, used outside NLCD's US+territories-only
+# coverage) -- a DIFFERENT, coarser 11-class scheme whose codes partially
+# COLLIDE with NLCD's own (e.g. both schemes use 11), so this must never be
+# looked up interchangeably with CN_TABLE; callers pass whichever table
+# actually matches the land_cover_grid's own source (see land_cover.
+# GLOBAL_LANDCOVER_CLASS_INFO / NLCD_CLASS_INFO). Values are this project's
+# own best analogues from the same NRCS TR-55 table CN_TABLE cites, matched
+# by land-cover description rather than copied from a global-scheme-
+# specific published source (none as authoritative as TR-55 exists for this
+# 11-class scheme) -- e.g. "Trees" -> TR-55's forest row, "Built Area" (this
+# scheme has no separate intensity tiers the way NLCD's four Developed
+# classes do) -> TR-55's Developed/Medium Intensity row, as a reasonable
+# single middle estimate. Treat this table as a coarser approximation than
+# CN_TABLE, not an equally-authoritative one -- flagged as such wherever a
+# global-source-derived runoff coefficient is reported (see web_app/app.py).
+CN_TABLE_GLOBAL = {
+    1: {"A": 100, "B": 100, "C": 100, "D": 100},    # Water
+    2: {"A": 30, "B": 55, "C": 70, "D": 77},        # Trees (-> Forest)
+    4: {"A": 30, "B": 30, "C": 30, "D": 30},        # Flooded Vegetation (-> Wetlands)
+    5: {"A": 67, "B": 78, "C": 85, "D": 89},        # Crops (-> Cultivated Crops)
+    7: {"A": 81, "B": 88, "C": 91, "D": 93},        # Built Area (-> Developed, Medium Intensity)
+    8: {"A": 77, "B": 86, "C": 91, "D": 94},        # Bare Ground (-> Barren Land)
+    11: {"A": 30, "B": 58, "C": 71, "D": 78},       # Rangeland (-> Grassland/Herbaceous)
+}
+
 
 def runoff_coefficient_from_land_cover(
     land_cover_grid: np.ndarray, hydrologic_group: str, catchment_mask: np.ndarray, storm_depth_mm: float,
+    cn_table: dict = CN_TABLE,
 ) -> float | None:
-    """A basin-specific runoff coefficient derived from real NLCD land
-    cover + SSURGO soil data, via the actual SCS Curve Number runoff
-    equation -- not a fixed CN-to-coefficient lookup, which would ignore a
-    real hydrologic fact: heavier storms produce proportionally MORE
-    runoff from the same ground, so a single fixed mapping from CN alone
-    can't be storm-depth-aware the way this project's design-storm-driven
-    analysis needs.
+    """A basin-specific runoff coefficient derived from real land cover
+    (NLCD, or geoai_agent.land_cover.fetch_global_landcover_grid's output
+    outside NLCD's US-only coverage -- pass the matching `cn_table` either
+    way, see CN_TABLE/CN_TABLE_GLOBAL above) + hydrologic soil group data,
+    via the actual SCS Curve Number runoff equation -- not a fixed
+    CN-to-coefficient lookup, which would ignore a real hydrologic fact:
+    heavier storms produce proportionally MORE runoff from the same
+    ground, so a single fixed mapping from CN alone can't be storm-depth-
+    aware the way this project's design-storm-driven analysis needs.
 
     For every cell where `catchment_mask` is True (a basin's own catchment
     membership -- same boolean-mask shape rank_flood_basins's own boundary_
     mask/descending-manifold lookups use), looks up that cell's Curve
-    Number from CN_TABLE[land_cover_grid[cell]][hydrologic_group] (silently
-    skipping a class code CN_TABLE has no row for), averages CN across the
+    Number from cn_table[land_cover_grid[cell]][hydrologic_group] (silently
+    skipping a class code cn_table has no row for), averages CN across the
     catchment's usable cells, then applies the standard metric SCS-CN
     runoff equation at `storm_depth_mm` (the selected design storm's own
     rainfall depth, e.g. RAINFALL_SCENARIOS[...]["intensity_mm_per_hr"] --
@@ -218,9 +248,9 @@ def runoff_coefficient_from_land_cover(
         return None
     cell_values = land_cover_grid[catchment_mask]
     cns = [
-        CN_TABLE[int(code)][hydrologic_group]
+        cn_table[int(code)][hydrologic_group]
         for code in cell_values
-        if int(code) in CN_TABLE
+        if int(code) in cn_table
     ]
     if not cns:
         return None
@@ -364,6 +394,7 @@ def rank_flood_basins(
     boundary_mask: np.ndarray | None = None,
     land_cover_grid: np.ndarray | None = None,
     hydrologic_group: str | None = None,
+    land_cover_cn_table: dict = CN_TABLE,
 ) -> dict:
     """Ranks every significant basin in `morse_result` (a TTK
     analyze_scalar_field_ttk result for `elevation_field`) by flood risk,
@@ -545,6 +576,7 @@ def rank_flood_basins(
             if mask is not None and mask.any():
                 derived = runoff_coefficient_from_land_cover(
                     land_cover_grid, hydrologic_group, mask, scenario["intensity_mm_per_hr"],
+                    cn_table=land_cover_cn_table,
                 )
                 if derived is not None:
                     basin_runoff_coefficient = derived
@@ -638,6 +670,7 @@ def compute_expected_annual_runoff(
     boundary_mask: np.ndarray | None = None,
     land_cover_grid: np.ndarray | None = None,
     hydrologic_group: str | None = None,
+    land_cover_cn_table: dict = CN_TABLE,
 ) -> dict:
     """A multi-storm AGGREGATE risk metric, layered on top of rank_flood_
     basins rather than replacing it: rank_flood_basins scores basins against
@@ -663,8 +696,9 @@ def compute_expected_annual_runoff(
     Every parameter besides `elevation_field`/`morse_result` is passed
     straight through to each of the six rank_flood_basins calls unchanged
     (same weights/runoff_coefficient/slope_field/exposure_field/
-    boundary_mask/land_cover_grid/hydrologic_group every time) -- only
-    `rainfall_scenario` varies call to call, driven by this function itself.
+    boundary_mask/land_cover_grid/hydrologic_group/land_cover_cn_table
+    every time) -- only `rainfall_scenario` varies call to call, driven by
+    this function itself.
 
     Returns {"basins": [{"catchment_id", "grid_index", "coords",
     "expected_annual_runoff_m3s", "per_scenario": {"2yr": <m3s>, ...}},
@@ -680,6 +714,7 @@ def compute_expected_annual_runoff(
             weights=weights, runoff_coefficient=runoff_coefficient, slope_field=slope_field,
             exposure_field=exposure_field, boundary_mask=boundary_mask,
             land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
+            land_cover_cn_table=land_cover_cn_table,
         )
 
     # AEP = 1 / return_period_years, sorted ascending return period ==

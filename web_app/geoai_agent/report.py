@@ -196,7 +196,7 @@ def _webmap_fragment(
     flow_field_geojson_data: dict | None = None,
     exposure_geojson_data: dict | None = None, land_cover_geojson_data: dict | None = None,
     roads_geojson_data: dict | None = None, water_geojson_data: dict | None = None,
-    rainfall_soil_geojson_data: dict | None = None,
+    rainfall_soil_geojson_data: dict | None = None, land_cover_source: str | None = None,
 ) -> str:
     """An embeddable (not standalone) Leaflet map: real OSM basemap, a
     toggleable terrain-colored hillshade elevation layer with a color
@@ -291,6 +291,7 @@ def _webmap_fragment(
         f"var rainfallSoilData = {json.dumps(rainfall_soil_geojson_data)};" if rainfall_soil_geojson_data
         else "var rainfallSoilData = null;"
     )
+    land_cover_layer_label = _land_cover_source_label(land_cover_source)
 
     return f"""
     <link rel="stylesheet" href="{_LEAFLET_CSS}" />
@@ -488,9 +489,9 @@ def _webmap_fragment(
       }}
 
       if (landCoverData) {{
-        // NLCD classified land cover (geoai_agent.land_cover) -- categorical,
+        // Classified land cover (geoai_agent.land_cover) -- categorical,
         // each cell keeps its own class color rather than a continuous ramp.
-        overlays['Land cover (NLCD)'] = L.geoJSON(landCoverData, {{
+        overlays['Land cover ({land_cover_layer_label})'] = L.geoJSON(landCoverData, {{
           style: function(f) {{ return {{ fillColor: f.properties.color, color: f.properties.color, weight: 0, fillOpacity: 0.65 }}; }},
           onEachFeature: function(f, layer) {{ layer.bindPopup('<b>' + f.properties.label + '</b>'); }},
         }});
@@ -662,8 +663,8 @@ def _webmap_fragment(
           (layerIsVisible(overlays['Population density (exposure)']) ?
             '<div style="margin-top:6px;"><strong>Population density</strong> (US Census block groups, live)</div>'
             : '') +
-          (layerIsVisible(overlays['Land cover (NLCD)']) ?
-            '<div style="margin-top:6px;"><strong>Land cover</strong> (NLCD, categorical -- click a cell for its class)</div>'
+          (layerIsVisible(overlays['Land cover ({land_cover_layer_label})']) ?
+            '<div style="margin-top:6px;"><strong>Land cover</strong> ({land_cover_layer_label}, categorical -- click a cell for its class)</div>'
             : '') +
           (layerIsVisible(overlays['Roads (OpenStreetMap)']) || layerIsVisible(overlays['Water (OpenStreetMap)']) ?
             '<div style="margin-top:6px;"><strong>Roads / water</strong> (OpenStreetMap)</div>'
@@ -966,6 +967,18 @@ def _elevation_source_description(elevation_source: str) -> str:
     return "the live Open-Meteo API (global coverage, ~90m resolution)"
 
 
+def _land_cover_source_label(land_cover_source: str | None) -> str:
+    """Plain-language name for whichever land-cover source actually backed
+    this run's runoff-coefficient calculation -- "NLCD" (US+territories
+    only) or, outside NLCD's coverage, land_cover.fetch_global_landcover_
+    grid's global Sentinel-2 10m classifier. Every report string that used
+    to hardcode "NLCD" now goes through this instead, so a non-US run
+    doesn't claim a US-only federal data source it never actually used."""
+    if land_cover_source == "global_sentinel2":
+        return "global Sentinel-2 10m land cover"
+    return "NLCD"
+
+
 def _capitalize_first(s: str) -> str:
     """Uppercases only the first character, leaving everything else exactly
     as-is -- NOT the same as str.capitalize(), which also force-lowercases
@@ -1023,7 +1036,9 @@ def _pipeline_narrative_html(
     river_gauge_data_available: bool,
     osm_infrastructure_data_available: bool,
     land_cover_data_available: bool,
+    land_cover_source: str | None,
     soil_data_available: bool,
+    hydrologic_group_source: str | None,
     exposure_source: str | None,
     expected_annual_runoff: dict | None,
     model_name: str,
@@ -1101,17 +1116,23 @@ def _pipeline_narrative_html(
         )
     steps.append(("Design storm (precipitation frequency)", rain_text))
 
+    lc_label = _land_cover_source_label(land_cover_source)
     if land_cover_data_available and soil_data_available:
+        soil_clause = (
+            "USDA SSURGO soil data" if hydrologic_group_source == "measured"
+            else "an assumed moderate-infiltration soil group (\"B\") -- no site-specific soil survey exists "
+                 "outside the US, so this is a documented engineering default, not a measurement"
+        )
         lc_text = (
-            "Each basin's own runoff coefficient was derived from real NLCD land cover and USDA SSURGO soil data "
+            f"Each basin's own runoff coefficient was derived from real {lc_label} land cover and {soil_clause} "
             "across its own catchment, via the actual SCS Curve Number runoff equation at this storm's rainfall "
             "depth -- not one constant assumed for the whole area (see each hotspot's \"Runoff coeff.\" column "
             "below)."
         )
     else:
         lc_text = (
-            "NLCD land cover / USDA SSURGO soil data wasn't available for this run, so every basin fell back to "
-            f"the same flat, assumed runoff coefficient ({flood_result.get('runoff_coefficient', 0.5):.2f})."
+            f"{lc_label} land cover / USDA SSURGO soil data wasn't available for this run, so every basin fell "
+            f"back to the same flat, assumed runoff coefficient ({flood_result.get('runoff_coefficient', 0.5):.2f})."
         )
     steps.append(("Land cover & soil", lc_text))
 
@@ -1149,6 +1170,8 @@ def _pipeline_narrative_html(
     exp_parts = []
     if exposure_source == "census_live":
         exp_parts.append("population exposure came from a live US Census block-group density fetch")
+    elif exposure_source == "worldpop_global":
+        exp_parts.append("population exposure came from WorldPop's global 100m density layer (US Census unavailable here)")
     elif exposure_source == "user_upload":
         exp_parts.append("population exposure came from a user-uploaded file")
     else:
@@ -1298,7 +1321,9 @@ def _data_sources_table_html(
     boundary_available: bool,
     rainfall_source_label: str,
     soil_data_available: bool,
+    hydrologic_group_source: str | None,
     land_cover_data_available: bool,
+    land_cover_source: str | None,
     exposure_source: str | None,
     osm_infrastructure_data_available: bool,
     fema_available: bool,
@@ -1314,7 +1339,8 @@ def _data_sources_table_html(
     facts woven into a stage-by-stage story) with a flat, at-a-glance
     reference -- the two aren't redundant, they're read differently."""
     exposure_status = {
-        "census_live": "used (US Census, live)", "user_upload": "used (user-uploaded)",
+        "census_live": "used (US Census, live)", "worldpop_global": "used (WorldPop global, live)",
+        "user_upload": "used (user-uploaded)",
     }.get(exposure_source, "not available this run")
     rows = [
         ("Elevation (terrain)", _elevation_source_description(elevation_source),
@@ -1326,8 +1352,11 @@ def _data_sources_table_html(
          "Sets the storm intensity fed into the Rational Method drainage-demand calculation and the risk score's rainfall factor.", rainfall_source_label),
         ("Soil (hydrologic group)", "USDA SSURGO, via Soil Data Access",
          "Infiltration classification (A-D) -- one input to the SCS Curve Number runoff coefficient, alongside land cover.",
-         "used" if soil_data_available else "not available this run"),
-        ("Land cover", "USGS/MRLC NLCD classified land cover",
+         "used" if hydrologic_group_source == "measured" else
+         "assumed default (\"B\") -- outside US soil survey coverage" if hydrologic_group_source == "assumed_default" else
+         "not available this run"),
+        ("Land cover", "USGS/MRLC NLCD classified land cover" if land_cover_source != "global_sentinel2"
+         else "Esri/Impact Observatory global Sentinel-2 10m land cover (NLCD unavailable here)",
          "The other input to the SCS Curve Number runoff coefficient -- how much of a basin's catchment is impervious vs. vegetated.",
          "used" if land_cover_data_available else "not available this run"),
         ("Population density (exposure)", "US Census block-group density (2020), or a user-uploaded file",
@@ -1438,16 +1467,25 @@ def _limitations_html(
             "grid are flagged individually above where this applies.",
         ))
 
-    if exposure_source in ("census_live", "user_upload"):
+    if exposure_source in ("census_live", "worldpop_global", "user_upload"):
+        density_aggregation_note = (
+            "Census block-group density is itself a spatial average over the whole block group, not a "
+            "fine-grained population surface -- treating it as a point value at one grid cell inherits that "
+            "aggregation's own uncertainty." if exposure_source == "census_live" else
+            "WorldPop's density estimate is itself a modeled 100m-cell surface (not a direct census count), "
+            "built from national census/survey data disaggregated by satellite-derived settlement patterns -- "
+            "a real, worldwide estimate, but a model output, not a direct measurement the way a US Census "
+            "block-group tally is." if exposure_source == "worldpop_global" else ""
+        )
         items.append((
-            "Exposure is measured at one grid cell, and Census density is a block-group average",
+            "Exposure is measured at one grid cell" + (
+                ", and Census density is a block-group average" if exposure_source == "census_live" else ""
+            ),
             "The exposure factor samples population/density data at a basin's own pour point ONLY -- a single "
             "grid cell, not an area total (see the exposure formula in the details above) -- so it can "
             "understate a basin whose deepest point happens to sit on a park, parking lot, or stream corridor "
             "even while the surrounding catchment is densely populated (the \"Buildings\" figure is a separate, "
-            "catchment-wide count precisely because of this gap). Census block-group density is itself a "
-            "spatial average over the whole block group, not a fine-grained population surface -- treating it "
-            "as a point value at one grid cell inherits that aggregation's own uncertainty. Neither measures "
+            f"catchment-wide count precisely because of this gap). {density_aggregation_note} Neither measures "
             "actual flood exposure (population or structures physically within a modeled inundation extent) -- "
             "this analysis has no inundation model to intersect with.",
         ))
@@ -2013,7 +2051,9 @@ def render_flood_report_html(
     river_gauge_data_available: bool = False,
     exposure_source: str | None = None,
     land_cover_data_available: bool = False,
+    land_cover_source: str | None = None,
     soil_data_available: bool = False,
+    hydrologic_group_source: str | None = None,
     expected_annual_runoff: dict | None = None,
     strategy_decision: dict | None = None,
     threshold_decision: dict | None = None,
@@ -2118,6 +2158,7 @@ def render_flood_report_html(
             fema_flood_geojson, pipes_geojson, gauges_geojson, buildings_geojson, boundary_mask,
             flow_field_geojson,
             exposure_geojson, land_cover_geojson_data, roads_geojson, water_geojson, rainfall_soil_geojson,
+            land_cover_source=land_cover_source,
         )
         if embed_interactive_map else ""
     )
@@ -2519,6 +2560,19 @@ def render_flood_report_html(
             "low (e.g. a park, stream corridor, or parking lot sitting at the literal bottom of the depression) "
             "even while the broader catchment around it is dense."
         )
+    elif exposure_source == "worldpop_global":
+        exposure_label = "WorldPop global 100m (live)"
+        exposure_score_formula_note = (
+            "WorldPop's global 100m gridded population density (people per km&sup2;, 2020 estimate, via its "
+            "public ArcGIS Living Atlas ImageServer -- see geoai_agent.real_data."
+            "fetch_global_population_density_field, used because no US Census coverage exists for this area) "
+            "<strong>at this basin's own pour point only</strong> (a single grid cell, not a catchment total or "
+            "average), min-max normalized against that field's range across the whole analysis grid. A modeled "
+            "estimate (built from census/survey data disaggregated by satellite-derived settlement patterns), "
+            "not a direct government count the way US Census block-group data is. This is a DIFFERENT "
+            "measurement from \"Buildings\" in the stat grid above (OpenStreetMap buildings across the basin's "
+            "entire catchment, a different data source)."
+        )
     elif exposure_source == "user_upload":
         exposure_label = "user-supplied"
         exposure_score_formula_note = (
@@ -2546,7 +2600,7 @@ def render_flood_report_html(
   <div class="stat"><span class="stat-label">Exposure data</span><span class="stat-value">{exposure_label}</span></div>
   <div class="stat"><span class="stat-label">FEMA flood data</span><span class="stat-value">{'NFHL (live)' if fema_available else 'not available for this area'}</span></div>
   <div class="stat"><span class="stat-label">River gauge data</span><span class="stat-value">{'USGS NWIS (live)' if river_gauge_data_available else 'no active gauges nearby'}</span></div>
-  <div class="stat"><span class="stat-label">Runoff coefficient</span><span class="stat-value">{'NLCD + SSURGO (live, per basin)' if land_cover_data_available and soil_data_available else 'assumed constant'}</span></div>
+  <div class="stat"><span class="stat-label">Runoff coefficient</span><span class="stat-value">{f"{_land_cover_source_label(land_cover_source)} + {'SSURGO soil' if hydrologic_group_source == 'measured' else 'assumed soil group'} (per basin)" if land_cover_data_available and soil_data_available else 'assumed constant'}</span></div>
 """
 
     rec_html = _md_to_html(recommendation) if recommendation else (
@@ -2591,7 +2645,8 @@ def render_flood_report_html(
         drainage_pipe_data_available=drainage_pipe_data_available,
         river_gauge_data_available=river_gauge_data_available,
         osm_infrastructure_data_available=osm_infrastructure_data_available,
-        land_cover_data_available=land_cover_data_available, soil_data_available=soil_data_available,
+        land_cover_data_available=land_cover_data_available, land_cover_source=land_cover_source,
+        soil_data_available=soil_data_available, hydrologic_group_source=hydrologic_group_source,
         exposure_source=exposure_source, expected_annual_runoff=expected_annual_runoff, model_name=model_name,
     )
     agent_decision_log_html = _agent_decision_log_html(
@@ -2625,7 +2680,9 @@ def render_flood_report_html(
     data_sources_table_html = _data_sources_table_html(
         elevation_source=elevation_source, boundary_available=boundary_available,
         rainfall_source_label=rainfall_source_label, soil_data_available=soil_data_available,
-        land_cover_data_available=land_cover_data_available, exposure_source=exposure_source,
+        hydrologic_group_source=hydrologic_group_source,
+        land_cover_data_available=land_cover_data_available, land_cover_source=land_cover_source,
+        exposure_source=exposure_source,
         osm_infrastructure_data_available=osm_infrastructure_data_available, fema_available=fema_available,
         river_gauge_data_available=river_gauge_data_available,
         drainage_pipe_data_available=drainage_pipe_data_available,
@@ -2773,7 +2830,7 @@ def render_flood_report_html(
   <section id="sec-hotspots">
     <h2>Ranked hotspots</h2>
     <p class="section-note">{scenario['label']}, 1-hour intensity ({scenario['intensity_mm_per_hr']:.0f} mm/hr, {rainfall_source_label})
-      {'&middot; runoff coefficient varies per basin -- see the "Runoff coeff." figure on each card below (land-cover-derived where NLCD/SSURGO data was available, assumed ' + str(flood_result['runoff_coefficient']) + ' elsewhere)' if coefficient_varies else '&middot; runoff coefficient ' + str(flood_result['runoff_coefficient']) + ' (assumed, same for every basin)'}
+      {'&middot; runoff coefficient varies per basin -- see the "Runoff coeff." figure on each card below (land-cover-derived where ' + _land_cover_source_label(land_cover_source) + '/soil data was available, assumed ' + str(flood_result['runoff_coefficient']) + ' elsewhere)' if coefficient_varies else '&middot; runoff coefficient ' + str(flood_result['runoff_coefficient']) + ' (assumed, same for every basin)'}
       -- each basin below shows every fact this run has about it in one place, including how it drains
       (runoff/pipe-capacity comparison), what real-world data corroborates or complicates the finding (FEMA,
       gauges), and its own breakdown of why it scored the way it did.</p>

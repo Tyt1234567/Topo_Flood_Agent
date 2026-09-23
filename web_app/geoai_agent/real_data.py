@@ -48,6 +48,7 @@ the multi-layer path.
 from __future__ import annotations
 
 import csv
+import io
 import json
 import math
 import re
@@ -706,6 +707,92 @@ def fetch_population_exposure_field(
             # else: no block group at this node (e.g. open water) -- left at 0.0
 
     return ScalarField(name="exposure", xs=xs, ys=ys, values=values)
+
+
+_WORLDPOP_IMAGE_SERVER_URL = "https://worldpop.arcgis.com/arcgis/rest/services/WorldPop_Population_Density_100m/ImageServer"
+# WorldPop's own NoData sentinel for this service (the standard float32
+# "negative max" convention) -- confirmed live (a real exportImage request
+# over a mixed land/water bbox returned this exact value at water/no-
+# coverage cells, not zero) rather than assumed from documentation.
+_WORLDPOP_NODATA_SENTINEL = -3.402823e38
+# This service's own time-enabled coverage tops out at 2020 (checked
+# directly via its timeInfo.timeExtent) -- WorldPop's global product line
+# hasn't been extended past 2020 in this Living Atlas item as of this
+# writing, unlike NLCD/the Sentinel-2 land-cover service above which do
+# track their own "latest available" via the same timeInfo mechanism. Fixed
+# here rather than queried per-request since there's nothing to discover.
+_WORLDPOP_TIME_MS = 1577836800000  # 2020-01-01 UTC
+
+
+def fetch_global_population_density_field(
+    bounds: tuple[float, float, float, float], resolution: int | tuple[int, int] = GRID_RESOLUTION,
+    timeout: float = 30.0,
+) -> ScalarField:
+    """Live-fetches WorldPop's global 100m gridded population density
+    (people/km2, 2020 estimate) over `bounds`, via its public ArcGIS Living
+    Atlas ImageServer -- no API key (confirmed live, despite being a Living
+    Atlas item), genuinely worldwide coverage (checked: extent spans the
+    full -180..180 longitude range), same exportImage-resized-server-side-
+    to-the-exact-grid pattern as geoai_agent.land_cover's NLCD/global-land-
+    cover fetches, just returning a continuous float raster instead of
+    classified codes (no nearest-neighbor-only resampling constraint here --
+    population density is a genuine continuous quantity, unlike a land-cover
+    class code).
+
+    Meant as fetch_population_exposure_field's fallback outside the US
+    (that function's own Census block-group source has no coverage there):
+    coarser (100m vs. block-group-scale, which is finer in dense urban
+    areas but coarser in sparse ones) and a fixed 2020 estimate rather than
+    the Census's own vintage, but real, live, worldwide data instead of the
+    flat neutral 0.5 default every caller would otherwise fall back to.
+
+    Raises RuntimeError on any failure -- network error, malformed
+    response, or a returned image whose every cell is NoData (e.g. entirely
+    open ocean, which WorldPop has no population estimate for) -- same
+    degrade-gracefully contract as every other optional source in this
+    project; callers should catch this and fall back further themselves."""
+    nx, ny = _as_axis_counts(resolution)
+    lat_min, lat_max, lon_min, lon_max = bounds
+    query = urllib.parse.urlencode({
+        "bbox": f"{lon_min},{lat_min},{lon_max},{lat_max}", "bboxSR": "4326", "imageSR": "4326",
+        "size": f"{nx},{ny}", "format": "tiff", "pixelType": "F32",
+        "interpolation": "RSP_BilinearInterpolation", "noData": str(_WORLDPOP_NODATA_SENTINEL),
+        "time": str(_WORLDPOP_TIME_MS), "f": "json",
+    })
+    try:
+        with urllib.request.urlopen(f"{_WORLDPOP_IMAGE_SERVER_URL}/exportImage?{query}", timeout=timeout) as resp:
+            meta = json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
+        raise RuntimeError(f"WorldPop exportImage request failed: {exc}") from exc
+
+    href = meta.get("href")
+    if not href:
+        raise RuntimeError(f"WorldPop exportImage returned no image href for this area: {meta}")
+    try:
+        with urllib.request.urlopen(href, timeout=timeout) as resp:
+            tiff_bytes = resp.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"Failed to download WorldPop exported image: {exc}") from exc
+
+    try:
+        from PIL import Image
+        image = Image.open(io.BytesIO(tiff_bytes))
+        values = np.array(image, dtype=np.float32)
+    except Exception as exc:
+        raise RuntimeError(f"Could not read WorldPop exported TIFF: {exc}") from exc
+
+    if values.shape != (ny, nx):
+        raise RuntimeError(f"WorldPop export returned a {values.shape} image, expected ({ny}, {nx}).")
+
+    nodata_mask = values < -1e30  # generous threshold around the sentinel -- float32 roundtrip through a TIFF isn't exact
+    if nodata_mask.all():
+        raise RuntimeError("WorldPop returned no usable population data for this entire area (e.g. open ocean).")
+    values = np.where(nodata_mask, 0.0, values)  # no coverage -> treat as uninhabited, same as fetch_population_exposure_field's implicit-zero convention for cells with no matching Census block group
+
+    xs, ys = _grid(bounds, resolution)
+    # Same north-to-south -> south-to-north row flip as land_cover.py's
+    # exportImage-based fetches -- Esri image services return row 0 = north.
+    return ScalarField(name="exposure", xs=xs, ys=ys, values=np.flipud(values))
 
 
 def derive_slope_field(elevation: ScalarField) -> ScalarField:
