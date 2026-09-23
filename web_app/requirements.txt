@@ -5,5 +5,4 @@ networkx
 numpy
 pyshp
 matplotlib
-psycopg2-binary
 python-dotenv

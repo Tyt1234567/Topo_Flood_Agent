@@ -31,7 +31,6 @@ in the root `README.md`'s Configuration section; short version:
 | Variable | Required? | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` | Yes | LLM routing/recommendation calls |
-| `DATABASE_URL` | No | Real stormwater pipe/catch-basin data (`geoai_agent/drainage_db.py`) -- see `../db_dump/README.md` to restore the bundled sample dataset |
 | `TTK_PYTHON`, `TTK_BIN_DIR` | No | Discrete-Morse (TTK) terrain analysis, if not at the defaults in `geoai_agent/ttk_engine.py` |
 | `QGIS_PYTHON` | No | Primary US elevation source (streamed USGS 3DEP DEM via GDAL), if not at the default in `geoai_agent/dem_cog_source.py`. Without it, elevation automatically falls back to USGS's Elevation Point Query Service, then Open-Meteo. |
 
@@ -44,8 +43,10 @@ Analyze -- everything else happens automatically:
 
 - **Parallel real-data retrieval** -- FEMA flood zones (NFHL), NOAA Atlas 14
   rainfall, USGS 3DEP elevation, USDA SSURGO soil, Census population
-  density, local stormwater pipes (`geoai_agent/drainage_db.py`), USGS
-  river gauges, and OpenStreetMap roads/buildings, fetched concurrently.
+  density, live stormwater pipe data for a handful of US cities/counties
+  (`geoai_agent/drainage_db.py`, no database -- queried live per request
+  like every other source here), USGS river gauges, and OpenStreetMap
+  roads/buildings, fetched concurrently.
 - **Real discrete-Morse (TTK) terrain analysis** -- watershed basins,
   persistence-based noise filtering, cross-checked against an independent
   D8 flow-direction computation.

@@ -733,17 +733,26 @@ _AGENT_MAX_RESOLUTION_METERS = 2000
 # payload that's slow/heavy for a browser to render -- this cap protects
 # the backend pipeline's own runtime, not map responsiveness.
 _AGENT_MAX_GRID_RESOLUTION = 500
-# real_data.py's own MAX_GRID_RESOLUTION (80) is what it originally tested/
-# tuned Open-Meteo's batch pacing against, but a real non-US run at 80x63
-# (5,040 points, 51 batches) still took 520s -- Open-Meteo's actual
-# anonymous per-minute limit is evidently tighter than 51 requests/~60s,
-# triggering several 65s retry-waits back to back. Capping lower here (not
-# in real_data.py itself, which other callers also rely on) trades some
-# resolution for a real non-US run actually finishing in demo-reasonable
-# time -- checked directly that this project's TTK/ranking pipeline itself
-# is fast regardless of grid size (~3.5s), so the fetch batch count, not
-# analysis quality, is the actual lever worth pulling here.
-_AGENT_NONUS_MAX_GRID_RESOLUTION = 45
+# This USED to be a much lower cap (45) for non-US locations: real_data.py's
+# own MAX_GRID_RESOLUTION (80) is what it originally tested/tuned Open-
+# Meteo's batch pacing against, but a real non-US run at 80x63 (5,040
+# points, 51 batches) still took 520s -- Open-Meteo's actual anonymous
+# per-minute limit is evidently tighter than 51 requests/~60s, triggering
+# several 65s retry-waits back to back. That was the ONLY non-US elevation
+# source at the time, so every non-US run paid that cost. Since then,
+# Copernicus GLO-30 (dem_cog_source.fetch_copernicus_dem_field) became the
+# PRIMARY non-US elevation source -- same GDAL-streamed-COG technique as
+# USGS 3DEP, resolution-independent cost (~2.5-4.8s flat, checked live
+# across London/Shanghai/Nairobi/Nanjing, 4/4 successes, no Open-Meteo
+# fallback triggered) -- so the original justification for capping this
+# far below the US value no longer applies to the common case; Open-Meteo
+# is now only the rare fallback for the small subset of GLO-30 tiles not
+# yet released. Matching the US cap trades a residual, rare risk (a huge
+# non-US bbox landing on one of those missing tiles, reverting to the old
+# slow Open-Meteo behavior) for real resolution on the (now typical) case
+# where Copernicus succeeds -- checked directly that TTK/ranking itself is
+# fast regardless of grid size, so this is a fetch-time tradeoff only.
+_AGENT_NONUS_MAX_GRID_RESOLUTION = _AGENT_MAX_GRID_RESOLUTION
 _AGENT_RAINFALL_SCENARIO = "100yr"
 _AGENT_RUNOFF_COEFFICIENT = 0.5
 # ~0 rather than exactly 0 -- TTK's simplification step compares against
@@ -1390,7 +1399,10 @@ def agent_analyze_stream():
                     return None, None, exc
 
             def _fetch_pipes():
-                return fetch_nearby_pipes(bounds)  # a local database, not a courtesy external API -- a failure here is unexpected enough to surface, not swallow
+                try:
+                    return fetch_nearby_pipes(bounds)
+                except Exception:
+                    return None  # same "treat any failure as unavailable" contract as every other live source here
 
             def _fetch_gauges():
                 try:
@@ -1541,7 +1553,7 @@ def agent_analyze_stream():
             if nearby_pipes:
                 yield line({"type": "step", "label": "Stormwater pipe data found", "detail": {"num_pipes_in_area": len(nearby_pipes)}})
             else:
-                yield line({"type": "step", "label": "No stormwater pipe data loaded for this area (currently DC-only -- see load_dc_stormwater.py)"})
+                yield line({"type": "step", "label": "No stormwater pipe data available for this area"})
 
             if river_gauges:
                 yield line({"type": "step", "label": "River/stream gauge data found", "detail": {"num_gauges_in_area": len(river_gauges)}})

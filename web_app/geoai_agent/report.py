@@ -402,8 +402,8 @@ def _webmap_fragment(
         }});
       }}
       if (pipesData) {{
-        // Real stormwater pipes from a local database (geoai_agent/
-        // drainage_db.py) -- currently DC-only, see load_dc_stormwater.py.
+        // Real stormwater pipes, queried live per request (geoai_agent/
+        // drainage_db.py) -- covers a handful of US cities/counties.
         // Colored by whether a Manning's-equation capacity could be
         // computed for that segment (most DC records are missing enough
         // of diameter/material/slope to size it -- see the report's own
@@ -2093,9 +2093,9 @@ def render_flood_report_html(
     terrain math, no extra data source), "nearest_road_m"/"nearest_
     building_m"/"nearest_water_m" (from OpenStreetMap, present only when
     `osm_infrastructure_data_available`), "nearby_pipe_capacity_m3s"
-    (from geoai_agent.drainage_db, present only when
-    `drainage_pipe_data_available` -- currently DC-only, see
-    load_dc_stormwater.py), "twi" (Topographic Wetness Index, from
+    (from geoai_agent.drainage_db, live-queried per request, present only
+    when `drainage_pipe_data_available` -- covers a handful of US cities/
+    counties, see that module's docstring), "twi" (Topographic Wetness Index, from
     spatial_analysis.compute_topographic_wetness_index -- always present
     whenever a slope layer was fetched this run, pure terrain math like
     aspect/relief, no extra data source), and "nearest_gauge" (from
@@ -2205,15 +2205,15 @@ def render_flood_report_html(
     pipe_note = (
         '<p class="section-note">Drainage-capacity comparisons below use the largest Manning\'s-equation full-'
         "flow estimate (see geoai_agent/drainage_db.py) among real stormwater pipes within 150m of each basin, "
-        "from a local database of Washington DC's own pipe network (diameter/material/slope) -- currently the "
-        "only city with this data loaded. It's an order-of-magnitude comparison against each basin's own "
-        "drainage demand, not an engineering-grade capacity study, and the nearest pipe by distance may be a "
-        "small lateral or a large trunk line -- this doesn't know which one actually serves that specific "
-        "basin.</p>"
+        "queried live from that area's own public GIS pipe network (diameter/material/slope, where available) "
+        "-- covers a handful of US cities/counties, not a nationwide dataset. It's an order-of-magnitude "
+        "comparison against each basin's own drainage demand, not an engineering-grade capacity study, and the "
+        "nearest pipe by distance may be a small lateral or a large trunk line -- this doesn't know which one "
+        "actually serves that specific basin.</p>"
         if has_pipes else
-        '<p class="section-note">No real stormwater pipe data is loaded for this area yet (currently DC-only) '
-        "-- the drainage-capacity notes below are each basin's own demand estimate only, not compared against "
-        "actual infrastructure.</p>" if drainage_pipe_data_available is False else ""
+        '<p class="section-note">No real stormwater pipe data is available for this area (live coverage is '
+        "limited to a handful of US cities/counties) -- the drainage-capacity notes below are each basin's own "
+        "demand estimate only, not compared against actual infrastructure.</p>" if drainage_pipe_data_available is False else ""
     )
     twi_note = (
         '<p class="section-note">TWI (Topographic Wetness Index) = ln(contributing area / tan(slope)) -- higher '

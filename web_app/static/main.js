@@ -276,8 +276,8 @@ function populateMap(mapData) {
     overlays["FEMA flood zones (NFHL)"] = mapLayers.femaFlood;
   }
 
-  // Real stormwater pipes from a local database (geoai_agent/drainage_db.py)
-  // -- currently DC-only, see load_dc_stormwater.py.
+  // Real stormwater pipes, queried live per request (geoai_agent/drainage_db.py)
+  // -- covers a handful of US cities/counties.
   if (mapData.pipes_geojson) {
     mapLayers.pipes = L.geoJSON(mapData.pipes_geojson, {
       style: (f) => ({ color: f.properties.capacity_m3s ? "#2b6cb0" : "#8894a0", weight: 2, opacity: 0.7 }),
