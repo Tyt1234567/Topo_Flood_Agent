@@ -1017,6 +1017,7 @@ def _pipeline_narrative_html(
     boundary_display_name: str | None,
     boundary_geojson: dict | None,
     fema_flood_geojson: dict | None,
+    svi_geojson: dict | None,
     gauges_geojson: dict | None,
     drainage_pipe_data_available: bool,
     river_gauge_data_available: bool,
@@ -1154,7 +1155,16 @@ def _pipeline_narrative_html(
         exp_parts.append("no population/exposure data was available, so that risk factor used a neutral default")
     if osm_infrastructure_data_available:
         exp_parts.append("OpenStreetMap building footprints were aggregated per basin into a building-count/density signal")
-    steps.append(("Exposure: population & buildings", _capitalize_first("; ".join(exp_parts)) + "."))
+    if svi_geojson:
+        exp_parts.append(
+            f"each basin's census tract was matched against CDC/ATSDR's Social Vulnerability Index "
+            f"({len(svi_geojson['features'])} tracts returned for this area) -- a published federal composite of "
+            "poverty, unemployment, income, and education, among other factors, supplementary context alongside "
+            "population density, not itself one of the weighted risk-score factors"
+        )
+    else:
+        exp_parts.append("CDC/ATSDR Social Vulnerability Index data was not available for this area")
+    steps.append(("Exposure: population, buildings & social vulnerability", _capitalize_first("; ".join(exp_parts)) + "."))
 
     if expected_annual_runoff and expected_annual_runoff.get("basins"):
         steps.append((
@@ -1988,6 +1998,7 @@ def render_flood_report_html(
     all_minima_hotspots: list[dict] | None = None,
     catchment_grid: list[list[int]] | None = None,
     fema_flood_geojson: dict | None = None,
+    svi_geojson: dict | None = None,
     pipes_geojson: dict | None = None,
     gauges_geojson: dict | None = None,
     buildings_geojson: dict | None = None,
@@ -2133,6 +2144,7 @@ def render_flood_report_html(
     has_twi = any(h.get("twi") is not None for h in hotspots)
     has_gauge = any(h.get("nearest_gauge") is not None for h in hotspots)
     has_buildings = any(h.get("buildings_in_catchment") is not None for h in hotspots)
+    has_svi = any(h.get("svi_percentile") is not None for h in hotspots)
 
     def _fmt_m(value: float | None) -> str:
         return f"{value:,.0f} m" if value is not None else "&ndash;"
@@ -2168,6 +2180,13 @@ def render_flood_report_html(
         "slope. Supplementary terrain context alongside each basin's persistence score, <strong>not</strong> one "
         "of the weighted factors in its risk score below.</p>" if has_twi else ""
     )
+    svi_note = (
+        '<p class="section-note">SVI percentile is CDC/ATSDR\'s published Social Vulnerability Index for that '
+        "basin's census tract -- an overall percentile rank (0-100%) against every US tract, built from poverty, "
+        "unemployment, income, education, disability, housing, and other factors. Supplementary socioeconomic "
+        "context alongside population-density exposure, <strong>not</strong> one of the weighted factors in the "
+        "risk score below.</p>" if has_svi else ""
+    )
     gauge_note = (
         '<p class="section-note">Nearest active USGS river/stream gauge (NWIS, live) within 2km, if any (see each '
         "basin's \"More detail\" below) -- a real fluvial (river-stage) signal independent of this run's own "
@@ -2183,7 +2202,7 @@ def render_flood_report_html(
         "Community-mapped coverage, not an official building count, and supplementary exposure context, "
         "<strong>not</strong> one of the weighted factors in risk score below.</p>" if has_buildings else ""
     )
-    shared_notes_html = "".join(n for n in (osm_note, pipe_note, twi_note, gauge_note, buildings_note) if n)
+    shared_notes_html = "".join(n for n in (osm_note, pipe_note, twi_note, gauge_note, buildings_note, svi_note) if n)
 
     def _hotspot_card_html(h: dict) -> str:
         """One significant basin's complete profile -- rank/coords/risk
@@ -2246,6 +2265,11 @@ def render_flood_report_html(
             f'<div class="stat"><span class="stat-label">TWI</span><span class="stat-value">{h["twi"]:.2f}</span></div>'
             if has_twi and h.get("twi") is not None else ""
         )
+        svi_stat = (
+            f'<div class="stat"><span class="stat-label">SVI percentile</span>'
+            f'<span class="stat-value">{h["svi_percentile"]:.0%}</span></div>'
+            if has_svi and h.get("svi_percentile") is not None else ""
+        )
         buildings_stat = ""
         if has_buildings and h.get("buildings_in_catchment") is not None:
             density = h.get("building_density_per_km2")
@@ -2272,6 +2296,7 @@ def render_flood_report_html(
           {fema_stat}
           {twi_stat}
           {buildings_stat}
+          {svi_stat}
           {ead_stat}
         </div>"""
 
@@ -2311,6 +2336,13 @@ def render_flood_report_html(
                 )
             else:
                 detail_rows.append("<dt>Nearest gauge</dt><dd>none within 2km</dd>")
+        if has_svi and h.get("svi_percentile") is not None:
+            detail_rows.append(
+                f"<dt>Social vulnerability</dt><dd>{html.escape(h.get('svi_severity') or '')} "
+                f"(socioeconomic-status theme: {h['svi_socioeconomic_percentile']:.0%} percentile)</dd>"
+                if h.get("svi_socioeconomic_percentile") is not None else
+                f"<dt>Social vulnerability</dt><dd>{html.escape(h.get('svi_severity') or '')}</dd>"
+            )
         if ead is not None:
             per = ead["per_scenario"]
             detail_rows.append(
@@ -2555,7 +2587,7 @@ def render_flood_report_html(
         place_label=place_label, bounds=bounds, elevation=elevation, elevation_source=elevation_source,
         morse_result=morse_result, flood_result=flood_result, boundary_available=boundary_available,
         boundary_display_name=boundary_display_name, boundary_geojson=boundary_geojson,
-        fema_flood_geojson=fema_flood_geojson, gauges_geojson=gauges_geojson,
+        fema_flood_geojson=fema_flood_geojson, svi_geojson=svi_geojson, gauges_geojson=gauges_geojson,
         drainage_pipe_data_available=drainage_pipe_data_available,
         river_gauge_data_available=river_gauge_data_available,
         osm_infrastructure_data_available=osm_infrastructure_data_available,

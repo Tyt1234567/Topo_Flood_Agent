@@ -341,6 +341,25 @@ You will be given JSON with:
     null only when no OpenStreetMap data was available for this run at
     all). Like "nearest_gauge"/"twi", this is supplementary context, NOT
     part of risk_score.
+  - "svi_percentile" / "svi_socioeconomic_percentile" / "svi_severity":
+    CDC/ATSDR's published Social Vulnerability Index for this basin's own
+    census tract (null if no SVI coverage for this run's area). "svi_
+    percentile" is the OVERALL percentile rank in [0, 1] of this tract
+    against every tract in the US (0.90 means "more socially vulnerable
+    than 90% of US tracts," NOT "90% of this tract's residents are
+    vulnerable" -- never conflate a percentile rank with a raw share of
+    population). "svi_socioeconomic_percentile" is specifically the
+    Socioeconomic Status theme (built from poverty, unemployment, income,
+    and education variables) -- cite this one, not the overall figure,
+    when a reviewer specifically asks about income/poverty/unemployment
+    exposure. "svi_severity" is the plain-language tier (low / moderate-low
+    / moderate-high / high) for the overall percentile. Like "nearest_
+    gauge"/"twi"/"buildings_in_catchment", this is supplementary
+    socioeconomic context, NOT part of risk_score and NOT the same
+    measurement as "exposure_score" (which is a population-DENSITY figure
+    at the basin's own pour point, not a vulnerability composite) -- don't
+    imply SVI was one of the weighted factors, and don't conflate it with
+    exposure_score if a reviewer asks why they differ.
   - "expected_annual_runoff_m3s": a SEPARATE aggregate figure (from flood_
     tools.compute_expected_annual_runoff, not part of risk_score or this
     basin's own single-storm "estimated_peak_runoff_m3s") integrating this
@@ -477,7 +496,8 @@ You will be given:
   estimated_peak_runoff_m3s, risk_score, catchment_id, within_boundary,
   fema_flood_zone, fema_flood_severity, nearest_gauge, twi,
   runoff_coefficient, runoff_coefficient_source, buildings_in_catchment,
-  building_density_per_km2.
+  building_density_per_km2, svi_percentile, svi_socioeconomic_percentile,
+  svi_severity.
   "nearest_gauge" is null when no active USGS river/stream gauge is within
   2km of that basin (the common case -- gauge coverage is sparse
   nationally, not an error), otherwise a real current reading
@@ -495,7 +515,15 @@ You will be given:
   "buildings_in_catchment"/"building_density_per_km2" count OpenStreetMap
   buildings within that basin's own catchment (0 is real, not missing;
   both null only if no OSM data was available this run at all) --
-  supplementary exposure context, not part of risk_score.
+  supplementary exposure context, not part of risk_score. "svi_percentile"
+  is CDC/ATSDR's published Social Vulnerability Index overall percentile
+  rank [0,1] for that basin's census tract against every US tract (a
+  RELATIVE rank, not a share of population); "svi_socioeconomic_percentile"
+  is specifically the poverty/unemployment/income/education theme within
+  it; "svi_severity" is the plain-language tier. All three are
+  supplementary socioeconomic context, not part of risk_score, and
+  distinct from "exposure_score" (a point-sampled population-density
+  figure, not a vulnerability composite).
   "total_raw_minima" is the true total; "entries" holds "included_count" of
   them, sorted by persistence_m descending (a global sink, persistence_m
   null, sorts first as maximally significant). Use this to actually filter,

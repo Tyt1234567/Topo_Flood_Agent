@@ -122,7 +122,16 @@ def build_persistence_candidates(scan_result: dict) -> list[dict]:
         candidates.append({"threshold": rounded, "label": label, "num_significant_basins": count})
 
     _add(auto_default, "default (5% of this run's elevation range)")
-    for pct in (50, 75, 90, 95):
+    # Denser percentile grid (was just 50/75/90/95) -- the system prompt
+    # above specifically asks the model to point to "a sharp drop-off in
+    # basin count between two adjacent candidates" as its evidence; a
+    # coarser 4-point grid can straddle a real break in the distribution
+    # without ever landing a candidate near it. More candidates costs
+    # nothing extra here (build_persistence_candidates is pure numpy over
+    # an already-computed persistence list, no new TTK/subprocess call),
+    # and llm_client.py's multi-key rotation now absorbs the small prompt-
+    # size increase this adds to the threshold-decision call.
+    for pct in (25, 40, 50, 60, 70, 80, 90, 95, 99):
         _add(float(np.percentile(persistences, pct)), f"{pct}th percentile of this run's raw-minima persistence")
 
     candidates.sort(key=lambda c: c["threshold"])

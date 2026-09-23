@@ -1206,10 +1206,13 @@ function showReport(event, placeLabel, options) {
   document.getElementById("report-title").textContent = `Report -- ${placeLabel}`;
   document.getElementById("report-frame").srcdoc = event.report_body_html;
 
-  const blob = new Blob([event.report_html], { type: "text/html" });
-  const url = URL.createObjectURL(blob);
+  // Rendered on demand server-side (see /api/agent/download_report/<run_id>)
+  // instead of shipped inline in the "done" event -- the standalone
+  // version embeds its own full copy of the interactive map (~22.6MB on a
+  // real run, duplicating what map_data below already carries), so it's
+  // only worth generating if this link is actually clicked.
   const link = document.getElementById("report-download");
-  link.href = url;
+  link.href = `/api/agent/download_report/${event.run_id}`;
   const safeName = placeLabel.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
   link.download = `flood-report-${safeName || "location"}.html`;
 

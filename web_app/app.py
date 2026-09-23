@@ -25,6 +25,7 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import json
+import re
 import tempfile
 import time
 import uuid
@@ -61,6 +62,7 @@ from geoai_agent.boundary import (
 )
 from geoai_agent.drainage_db import fetch_nearby_pipes, pipes_to_geojson, tag_hotspots_with_drainage_capacity
 from geoai_agent.fema_flood import fetch_fema_flood_zones, tag_hotspots_with_flood_zone
+from geoai_agent.social_vulnerability import fetch_social_vulnerability_zones, tag_hotspots_with_svi
 from geoai_agent.flood_tools import (
     RAINFALL_SCENARIOS,
     WEIGHT_PRESETS,
@@ -157,6 +159,41 @@ def _layer_summary(result: dict) -> dict:
 
 _DATASET_CACHE_TTL_SECONDS = 15 * 60
 _dataset_cache: dict[str, tuple[float, object]] = {}
+
+# Same cache pattern as _dataset_cache above, keyed by the run's own
+# run_id (already generated once per agent_analyze_stream call -- see
+# `yield line({"type": "run_id", ...})`), holding the kwargs needed to
+# (re)build the standalone downloadable report. Checked directly on a real
+# College Park, MD run: the standalone report_html (its own embedded copy
+# of the interactive map -- field/exposure/land-cover/roads/buildings/etc,
+# duplicating what the live UI's own map_data already carries separately)
+# was 22.6MB, roughly half of the whole "done" event's ~45MB payload, sent
+# eagerly on every single run whether or not anyone ever clicks download.
+# Caching the ingredients and rendering report_html on demand (see
+# /api/agent/download_report/<run_id> below) instead of inline in "done"
+# cuts that run's own network payload by that same ~22.6MB for the common
+# case nobody downloads it, at the cost of one extra render (already fast
+# -- under a second, see report.py) the rare time someone actually does.
+_REPORT_KWARGS_CACHE_TTL_SECONDS = 15 * 60
+_report_kwargs_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _cache_report_kwargs(run_id: str, report_kwargs: dict) -> None:
+    now = time.time()
+    for key in [k for k, (ts, _) in _report_kwargs_cache.items() if now - ts > _REPORT_KWARGS_CACHE_TTL_SECONDS]:
+        del _report_kwargs_cache[key]
+    _report_kwargs_cache[run_id] = (now, report_kwargs)
+
+
+def _get_cached_report_kwargs(run_id: str) -> dict | None:
+    entry = _report_kwargs_cache.get(run_id)
+    if entry is None:
+        return None
+    ts, report_kwargs = entry
+    if time.time() - ts > _REPORT_KWARGS_CACHE_TTL_SECONDS:
+        del _report_kwargs_cache[run_id]
+        return None
+    return report_kwargs
 
 
 def _cache_dataset(dataset) -> str:
@@ -702,20 +739,23 @@ _AGENT_ALL_MINIMA_THRESHOLD = 1e-6
 _QA_ALL_MINIMA_CAP = 500
 # Cap on how many significant-basin hotspots (and EAD per-basin entries) are
 # serialized in full into the recommendation-writing prompt (see
-# _build_user_context below). A run with ~70 significant basins, each
-# carrying ~20 fields (five per-factor scores, runoff coefficient+source,
-# FEMA/gauge/TWI/building-exposure tags, EAD per-return-period breakdown),
-# was observed directly to push generation past 150s on every one of 3
-# attempts ("The read operation timed out" on all of them, not a 504 from
-# Google -- genuinely slow generation, not a hang/quota issue), and even
-# after trimming to 15 a real run's generation still took 176-480s -- content
-# complexity, not just character count, drives generation time here. The
-# recommendation only ever needs to discuss a handful of hotspots in depth
-# regardless of how many significant basins a run finds, so only the top
-# N by risk_score are sent in full; the rest are summarized in one line.
-# Lowered 15 -> 8 to cut real generation time further, not just guard
-# against an extreme-case timeout.
-_RECOMMENDATION_TOP_N_HOTSPOTS = 8
+# _build_user_context below). Originally lowered as far as 8 after a run
+# with ~70 significant basins, each still carrying its full raw field set
+# (~20 fields including several never-referenced bookkeeping ones), pushed
+# generation past 150s on every one of 3 attempts. Two things changed since:
+# _RECOMMENDATION_DROP_HOTSPOT_FIELDS below now strips the fields the system
+# prompt never reads at all, and llm_client.py now rotates across multiple
+# API keys on a quota/auth failure instead of just failing -- so a slower
+# generation is a cost, not an outright failure, the way it was originally.
+# Raised back up to 25: a real 70-basin/13KB-prompt run (this cap's fields
+# already trimmed) was observed completing recommendation generation in
+# 20-45s even under genuine same-day Gemini 503 pressure, so the tighter
+# cap was mostly costing the recommendation useful basin coverage rather
+# than buying meaningful reliability at this point. The recommendation
+# still only needs to discuss a handful of hotspots in depth regardless of
+# how many significant basins a run finds, so only the top N by risk_score
+# are sent in full; the rest are summarized in one line.
+_RECOMMENDATION_TOP_N_HOTSPOTS = 25
 # Fields dropped from each hotspot before it's serialized into the prompt --
 # pure internal bookkeeping (grid_index/catchment_id/map_catchment_id are
 # used only for raster indexing and the report's own clickable point-links;
@@ -1258,6 +1298,12 @@ def agent_analyze_stream():
                 except Exception:
                     return None  # a courtesy public ArcGIS instance with no SLA -- treat any failure as "no data", not fatal
 
+            def _fetch_svi():
+                try:
+                    return fetch_social_vulnerability_zones(bounds)
+                except Exception:
+                    return None  # CDC/ATSDR's public ArcGIS instance -- same "treat any failure as unavailable" contract as every other live source here
+
             def _fetch_rainfall():
                 try:
                     return rainfall.fetch_noaa_atlas14_rainfall((lat_min0 + lat_max0) / 2, (lon_min0 + lon_max0) / 2)
@@ -1321,11 +1367,12 @@ def agent_analyze_stream():
                 except Exception:
                     return None
 
-            yield line({"type": "step", "label": "Retrieving data from 8 sources (4 concurrent workers)", "detail": {
+            yield line({"type": "step", "label": "Retrieving data from 9 sources (5 concurrent workers)", "detail": {
                 "target_resolution_meters": target_resolution_meters, "grid": list(resolution),
             }})
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
                 fut_fema = pool.submit(_fetch_fema)
+                fut_svi = pool.submit(_fetch_svi)
                 fut_rainfall = pool.submit(_fetch_rainfall)
                 fut_elevation = pool.submit(_fetch_elevation)
                 fut_soil = pool.submit(_fetch_soil)
@@ -1355,6 +1402,7 @@ def agent_analyze_stream():
                 fut_landcover = pool.submit(fetch_nlcd_landcover_grid, bounds, resolution=elevation_field.shape[::-1])
 
                 fema_flood_geojson = fut_fema.result()
+                svi_geojson = fut_svi.result()
                 rainfall_table = fut_rainfall.result()
                 hydrologic_group = fut_soil.result()
                 exposure_source, exposure_field, exposure_exc = fut_exposure.result()
@@ -1384,6 +1432,17 @@ def agent_analyze_stream():
                 }})
             else:
                 yield line({"type": "step", "label": "No FEMA flood hazard data available for this area"})
+
+            if svi_geojson and boundary is not None:
+                svi_geojson = clip_geojson_to_polygon(svi_geojson, boundary["polygon"])
+                if not svi_geojson["features"]:
+                    svi_geojson = None  # every returned tract was entirely outside the real boundary
+            if svi_geojson:
+                yield line({"type": "step", "label": "CDC/ATSDR Social Vulnerability Index data found", "detail": {
+                    "num_tracts": len(svi_geojson["features"]),
+                }})
+            else:
+                yield line({"type": "step", "label": "No CDC/ATSDR Social Vulnerability Index data available for this area"})
 
             if rainfall_table:
                 yield line({"type": "step", "label": "NOAA Atlas 14 data loaded", "detail": {
@@ -1612,6 +1671,8 @@ def agent_analyze_stream():
                     tag_hotspots_within_boundary(flood_result["hotspots"], boundary["polygon"])
                 if fema_flood_geojson:
                     tag_hotspots_with_flood_zone(flood_result["hotspots"], fema_flood_geojson)
+                if svi_geojson:
+                    tag_hotspots_with_svi(flood_result["hotspots"], svi_geojson)
                 yield line({"type": "step", "label": "Flood ranking complete", "detail": {"num_hotspots": len(flood_result["hotspots"])}})
 
                 # Evidence-chain check: does a Morse-persistence-significant
@@ -2011,6 +2072,8 @@ def agent_analyze_stream():
                     tag_hotspots_within_boundary(all_minima_hotspots, boundary["polygon"])
                 if fema_flood_geojson:
                     tag_hotspots_with_flood_zone(all_minima_hotspots, fema_flood_geojson)
+                if svi_geojson:
+                    tag_hotspots_with_svi(all_minima_hotspots, svi_geojson)
                 if river_gauges:
                     tag_hotspots_with_river_gauge(all_minima_hotspots, river_gauges)
                 compute_topographic_wetness_index(all_minima_hotspots, elevation_field, slope_field)
@@ -2371,6 +2434,9 @@ def agent_analyze_stream():
                             "runoff_coefficient_source": h.get("runoff_coefficient_source"),
                             "buildings_in_catchment": h.get("buildings_in_catchment"),
                             "building_density_per_km2": h.get("building_density_per_km2"),
+                            "svi_percentile": h.get("svi_percentile"),
+                            "svi_socioeconomic_percentile": h.get("svi_socioeconomic_percentile"),
+                            "svi_severity": h.get("svi_severity"),
                         }
                         for h in all_minima_included
                     ],
@@ -2378,6 +2444,7 @@ def agent_analyze_stream():
                 "exposure_data_supplied": exposure_field is not None,
                 "exposure_source": exposure_source,
                 "fema_flood_data_available": fema_flood_geojson is not None,
+                "svi_data_available": svi_geojson is not None,
                 "drainage_pipe_data_available": nearby_pipes is not None,
                 "osm_infrastructure_data_available": osm_infra is not None,
                 "river_gauge_data_available": bool(river_gauges),
@@ -2413,6 +2480,7 @@ def agent_analyze_stream():
                 all_minima_hotspots=all_minima_hotspots,
                 catchment_grid=catchment_grid,
                 fema_flood_geojson=fema_flood_geojson,
+                svi_geojson=svi_geojson,
                 pipes_geojson=pipes_geojson_data,
                 gauges_geojson=gauges_geojson_data,
                 buildings_geojson=buildings_geojson_data,
@@ -2434,14 +2502,18 @@ def agent_analyze_stream():
                 weight_sensitivity=weight_sensitivity,
                 morse_vs_d8=morse_vs_d8,
             )
-            # Standalone version (embedded interactive map) is what the
-            # download link/.html file actually is -- it has to stay a
-            # complete, self-contained artifact once saved. The in-page
-            # version skips that embedded map since the live UI renders its
-            # own persistent map in a separate panel (map_data below) rather
-            # than duplicating a second Leaflet instance inside an iframe.
-            report_html = render_flood_report_html(**report_kwargs, embed_interactive_map=True)
+            # The in-page report skips the embedded map (the live UI renders
+            # its own persistent map in a separate panel from map_data
+            # below) -- this is the only version rendered eagerly. The
+            # standalone, self-contained download version (embed_
+            # interactive_map=True) duplicates map_data's own layers into
+            # its own embedded copy, which is what makes it large (~22.6MB
+            # on a real run) -- rendered on demand instead, only if the
+            # user actually clicks download, via /api/agent/download_report
+            # below; report_kwargs is cached now so that route can rebuild
+            # it later without re-running the whole pipeline.
             report_body_html = render_flood_report_html(**report_kwargs, embed_interactive_map=False)
+            _cache_report_kwargs(run_id, report_kwargs)
 
             lat_min, lat_max, lon_min, lon_max = bounds
             map_data = {
@@ -2461,13 +2533,37 @@ def agent_analyze_stream():
                 "water_geojson": water_geojson_data,
                 "rainfall_soil_geojson": rainfall_soil_geojson_data,
             }
-            yield line({"type": "done", "report_html": report_html, "report_body_html": report_body_html,
+            yield line({"type": "done", "run_id": run_id, "report_body_html": report_body_html,
                         "map_data": map_data, "qa_context": qa_context, "place_label": place_label,
                         "total_elapsed_seconds": round(time.time() - t_start, 2)})
         except Exception as exc:
             yield line({"type": "error", "message": f"Unexpected error: {exc}"})
 
     return Response(generate(), mimetype="application/x-ndjson")
+
+
+@app.route("/api/agent/download_report/<run_id>", methods=["GET"])
+def agent_download_report(run_id):
+    """Renders and returns the standalone, self-contained downloadable
+    report .html for a completed run -- the embedded-interactive-map
+    version agent_analyze_stream's "done" event used to send inline on
+    every run (see _cache_report_kwargs's docstring for why: it duplicates
+    map_data's own layers into its own embedded copy, ~22.6MB on a real
+    run, most of it never actually downloaded). Rendered fresh here, on
+    demand, from report_kwargs cached under this run's own run_id --
+    same TTL/cleanup pattern as _dataset_cache elsewhere in this file, not
+    a re-run of the pipeline itself (report_kwargs already has every
+    number/layer this needs)."""
+    report_kwargs = _get_cached_report_kwargs(run_id)
+    if report_kwargs is None:
+        return jsonify({"error": "This run's report data has expired or was never generated -- re-run the analysis."}), 404
+    report_html = render_flood_report_html(**report_kwargs, embed_interactive_map=True)
+    place_label = report_kwargs.get("place_label") or "location"
+    safe_name = re.sub(r"[^a-z0-9]+", "-", place_label.lower()).strip("-") or "location"
+    return Response(
+        report_html, mimetype="text/html",
+        headers={"Content-Disposition": f'attachment; filename="flood-report-{safe_name}.html"'},
+    )
 
 
 # -- Report Q&A chat: the LLM as the front-facing agent, not just the ----

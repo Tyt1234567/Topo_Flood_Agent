@@ -279,6 +279,26 @@ def clip_geojson_to_polygon(geojson: dict | None, polygon: BaseGeometry) -> dict
             continue
 
         want_types = _POLYGONAL if geom.geom_type in _POLYGONAL else _LINEAR
+        # `prepared` (a shapely PreparedGeometry) only accelerates boolean
+        # predicates (contains/intersects), not geometry-returning ops --
+        # prepared.intersection() doesn't exist. But most real datasets
+        # against a real, detailed place boundary (e.g. Nominatim's own
+        # multi-thousand-vertex polygon for a town) are overwhelmingly
+        # either fully inside or fully outside it -- only a handful of
+        # features actually straddle the line. Checked directly: a real
+        # College Park, MD run clipping 12,138 OSM roads against its own
+        # resolved boundary took 5+ CPU-minutes calling full polygon.
+        # intersection() on every single road; skipping (not computing
+        # anything) for fully-outside roads and keeping the geometry AS-IS
+        # (not recomputing an intersection that would just return the same
+        # shape) for fully-inside ones cuts this to the cheap `prepared`
+        # predicate for all but the boundary-straddling minority, which are
+        # the only features that still pay for a real intersection() call.
+        if not prepared.intersects(geom):
+            continue
+        if prepared.contains(geom):
+            clipped_features.append(feature)
+            continue
         try:
             intersection = polygon.intersection(geom)
         except Exception:

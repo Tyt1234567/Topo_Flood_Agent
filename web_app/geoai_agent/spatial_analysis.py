@@ -335,6 +335,58 @@ def compute_building_exposure(
     return ways_by_catchment
 
 
+# Web-map-only geometry simplification: raw Overpass coordinates carry ~7
+# decimal places (sub-centimeter precision -- pointless for a Leaflet
+# overlay rendered at, at most, building-scale zoom) and roads/water ways
+# especially can carry many near-collinear intermediate points a road's
+# real curvature doesn't need at web-map scale. Checked directly on a real
+# College Park, MD run: the raw embedded roads+buildings+water layers made
+# the final downloadable report/live-map payload ~46MB; this cuts vertex
+# count and coordinate string length with no visible difference at any
+# zoom level a user would actually view the map at (~3m tolerance, well
+# under a single web-map pixel except at extreme close-in zoom). This
+# mirrors fema_flood.py's own geometryPrecision/maxAllowableOffset
+# simplification of ArcGIS-served flood-zone polygons for the identical
+# reason -- OSM's Overpass API has no server-side equivalent, so it's done
+# here instead, once, at conversion time rather than repeatedly by every
+# caller.
+_WEBMAP_SIMPLIFY_TOLERANCE_DEG = 0.00003  # ~3m at this latitude range
+_WEBMAP_COORD_NDIGITS = 5  # ~1.1m precision
+
+
+def _simplify_line_coords(coords: list) -> list:
+    """[[lon, lat], ...] -> simplified, rounded [[lon, lat], ...]. Falls
+    back to the rounded-but-unsimplified input if shapely can't build a
+    valid LineString from it (e.g. fewer than 2 distinct points)."""
+    from shapely.geometry import LineString
+
+    try:
+        simplified = LineString(coords).simplify(_WEBMAP_SIMPLIFY_TOLERANCE_DEG, preserve_topology=True)
+        pts = list(simplified.coords)
+    except Exception:
+        pts = coords
+    return [[round(x, _WEBMAP_COORD_NDIGITS), round(y, _WEBMAP_COORD_NDIGITS)] for x, y in pts]
+
+
+def _simplify_ring_coords(ring: list) -> list:
+    """Same as _simplify_line_coords but for a closed polygon ring --
+    simplifies via shapely's Polygon (not LineString) so the result stays a
+    valid, closed ring, and re-closes it if simplification's own output
+    isn't (shapely doesn't guarantee first==last on a simplified exterior
+    unless the input already was, which every caller here already ensures)."""
+    from shapely.geometry import Polygon
+
+    try:
+        simplified = Polygon(ring).simplify(_WEBMAP_SIMPLIFY_TOLERANCE_DEG, preserve_topology=True)
+        pts = list(simplified.exterior.coords)
+    except Exception:
+        pts = ring
+    rounded = [[round(x, _WEBMAP_COORD_NDIGITS), round(y, _WEBMAP_COORD_NDIGITS)] for x, y in pts]
+    if rounded[0] != rounded[-1]:
+        rounded.append(rounded[0])
+    return rounded
+
+
 def buildings_geojson(ways_by_catchment: dict[int, list]) -> dict:
     """`compute_building_exposure`'s returned catchment_id -> building-ways
     mapping, as a GeoJSON FeatureCollection of Polygons (one per building,
@@ -347,12 +399,18 @@ def buildings_geojson(ways_by_catchment: dict[int, list]) -> dict:
     highlightCatchment), so clicking a basin shows the REAL buildings
     counted toward its "buildings_in_catchment"/"building_density_per_km2"
     figures, not just the aggregate number on its own."""
+    # Rounded, not simplified: buildings are already small, few-vertex
+    # rectangles (unlike roads/water below), so there's little redundant
+    # point density to remove -- simplifying at the same tolerance risks
+    # visibly distorting a small footprint's actual shape for little size
+    # benefit. Coordinate rounding alone (still ~1.1m precision) is the
+    # safe, still-worthwhile win here.
     features = []
     for catchment_id, ways in ways_by_catchment.items():
         for way in ways:
             if len(way) < 3:
                 continue  # not enough vertices for a real polygon
-            ring = [[lon, lat] for lat, lon in way]
+            ring = [[round(lon, _WEBMAP_COORD_NDIGITS), round(lat, _WEBMAP_COORD_NDIGITS)] for lat, lon in way]
             if ring[0] != ring[-1]:
                 ring.append(ring[0])  # GeoJSON polygons must be closed rings
             features.append({
@@ -369,14 +427,20 @@ def roads_geojson(ways: list) -> dict:
     fetched area on the map -- same "own its own _to_geojson conversion"
     convention as buildings_geojson above, just unconditional (a run's
     roads are far fewer than its buildings, and unlike buildings there's no
-    existing per-catchment aggregate to key this by)."""
+    existing per-catchment aggregate to key this by). Geometry is
+    simplified (see _simplify_line_coords) -- roads are this project's
+    single largest map layer by feature count and point density, and the
+    dominant contributor to a real run's response payload size."""
     features = []
     for way in ways:
         if len(way) < 2:
             continue
+        coords = _simplify_line_coords([[lon, lat] for lat, lon in way])
+        if len(coords) < 2:
+            continue  # simplification collapsed this way to a single point
         features.append({
             "type": "Feature", "properties": {},
-            "geometry": {"type": "LineString", "coordinates": [[lon, lat] for lat, lon in way]},
+            "geometry": {"type": "LineString", "coordinates": coords},
         })
     return {"type": "FeatureCollection", "features": features}
 
@@ -387,17 +451,26 @@ def water_geojson(ways: list) -> dict:
     reservoirs) and a LineString for open ones (rivers/streams tagged
     waterway=* often aren't closed rings), same closure test buildings_
     geojson doesn't need (OSM building ways are always closed) but a
-    natural=water/waterway=* mix genuinely isn't."""
+    natural=water/waterway=* mix genuinely isn't. Geometry is simplified
+    (see _simplify_line_coords/_simplify_ring_coords), same reasoning as
+    roads_geojson above -- a river/shoreline way can carry as many
+    intermediate points as a road."""
     features = []
     for way in ways:
         if len(way) < 2:
             continue
-        coords = [[lon, lat] for lat, lon in way]
-        closed = len(coords) >= 3 and coords[0] == coords[-1]
-        geometry = (
-            {"type": "Polygon", "coordinates": [coords]} if closed
-            else {"type": "LineString", "coordinates": coords}
-        )
+        raw_coords = [[lon, lat] for lat, lon in way]
+        closed = len(raw_coords) >= 3 and raw_coords[0] == raw_coords[-1]
+        if closed:
+            coords = _simplify_ring_coords(raw_coords)
+            if len(coords) < 4:
+                continue  # simplification collapsed this ring below a valid polygon
+            geometry = {"type": "Polygon", "coordinates": [coords]}
+        else:
+            coords = _simplify_line_coords(raw_coords)
+            if len(coords) < 2:
+                continue
+            geometry = {"type": "LineString", "coordinates": coords}
         features.append({"type": "Feature", "properties": {}, "geometry": geometry})
     return {"type": "FeatureCollection", "features": features}
 
