@@ -34,6 +34,7 @@ from geoai_agent.morse_topology import ScalarField
 
 QGIS_PYTHON = os.environ.get("QGIS_PYTHON", r"D:\QGIS\bin\python-qgis.bat")
 _WORKER_SCRIPT = str(Path(__file__).resolve().parent / "_gdal_dem_worker.py")
+_COPERNICUS_WORKER_SCRIPT = str(Path(__file__).resolve().parent / "_gdal_copernicus_dem_worker.py")
 _LOCAL_RASTER_WORKER_SCRIPT = str(Path(__file__).resolve().parent / "_gdal_local_raster_worker.py")
 _SUBPROCESS_TIMEOUT_SECONDS = 120
 
@@ -104,6 +105,60 @@ def fetch_usgs_dem_cog_field(
 
     # GDAL reads top row = north; the rest of this codebase's grids
     # (ys = linspace(lat_min, lat_max, ny)) run south-to-north.
+    values = np.flipud(values)
+    values = _fill_nan_nearest(values)
+
+    xs, ys = _grid(bounds, resolution)
+    return ScalarField(name="elevation", xs=xs, ys=ys, values=values)
+
+
+def fetch_copernicus_dem_field(
+    bounds: tuple[float, float, float, float], resolution: int | tuple[int, int],
+) -> ScalarField:
+    """Live-streams Copernicus GLO-30 (global, 30m) elevation for `bounds`
+    as an actual clipped-and-resampled raster, the same streamed-COG
+    technique as fetch_usgs_dem_cog_field above (see _gdal_copernicus_dem_
+    worker.py for exactly what runs) -- this project's elevation source
+    outside the continental US, where 3DEP has no coverage at all.
+
+    Meant as a FAST alternative to real_data.fetch_open_meteo_field's
+    per-point-batched, rate-limited approach for non-US locations: checked
+    directly, a real London run's elevation fetch took Open-Meteo 156-520s
+    (retry-wait-dependent) for an 80x63-ish grid; this streams the same
+    area from a source raster in effectively the same handful of seconds
+    fetch_usgs_dem_cog_field already takes for a US location, since GDAL
+    only reads the byte ranges it actually needs regardless of point count.
+
+    Raises RuntimeError/DEMSourceUnavailableError on any failure -- most
+    commonly the QGIS-bundled-GDAL bridge being unavailable (same
+    DEMSourceUnavailableError fetch_usgs_dem_cog_field raises), or the
+    requested area falling in the small subset of tiles GLO-30 Public
+    doesn't have released yet -- callers should catch this and fall back to
+    Open-Meteo, the same "coarser/slower but real beats a hard failure"
+    contract every other layered fallback in this project follows."""
+    _check_available()
+    from geoai_agent.real_data import _as_axis_counts, _grid  # local import: avoid a circular import at module load
+
+    lat_min, lat_max, lon_min, lon_max = bounds
+    nx, ny = _as_axis_counts(resolution)
+
+    with tempfile.TemporaryDirectory(prefix="copernicus_dem_cog_") as tmp_dir:
+        out_path = Path(tmp_dir) / "dem.npz"
+        proc = subprocess.run(
+            [
+                QGIS_PYTHON, _COPERNICUS_WORKER_SCRIPT, str(out_path),
+                str(lat_min), str(lat_max), str(lon_min), str(lon_max), str(nx), str(ny),
+            ],
+            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Copernicus DEM COG worker process failed (exit {proc.returncode}): "
+                f"{proc.stderr or proc.stdout}"
+            )
+        with np.load(out_path) as data:
+            values = data["values"]
+
     values = np.flipud(values)
     values = _fill_nan_nearest(values)
 

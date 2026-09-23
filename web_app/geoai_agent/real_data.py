@@ -83,8 +83,13 @@ _OPEN_METEO_MINUTELY_RETRY_WAIT_SECONDS = 65
 _OPEN_METEO_MINUTELY_MAX_RETRIES = 2
 # Proactive spacing between batches, so a large grid never bursts past the
 # per-minute cap in the first place -- the reactive retry above is only a
-# safety net for whatever residual burst still slips through.
-_OPEN_METEO_BATCH_PACING_SECONDS = 1.0
+# safety net for whatever residual burst still slips through. Raised from
+# 1.0 after a real 51-batch fetch at the old pacing still triggered several
+# 65s retry-waits back to back (520s total for what should have been ~51s
+# of pacing alone) -- the actual anonymous-tier per-minute ceiling is
+# evidently tighter than 1 request/second sustained, so pacing more slowly
+# up front is cheaper in expectation than eating repeated 65s penalties.
+_OPEN_METEO_BATCH_PACING_SECONDS = 1.5
 _METERS_PER_DEGREE_LAT = 111_320
 
 # USGS EPQS is queried one point at a time (no batch endpoint). Measured
@@ -836,8 +841,15 @@ def build_real_world_dataset(
       USGS's Elevation Point Query Service (one HTTP request per grid
       point, so only usable up to MAX_USGS_GRID_RESOLUTION), then to
       Open-Meteo (global, ~90m, much higher point-count ceiling but lower
-      precision) as the last resort. Outside the continental US, goes
-      straight to Open-Meteo.
+      precision) as the last resort. Outside the continental US, prefers
+      the SAME streamed-COG technique against Copernicus GLO-30 instead
+      (fetch_copernicus_dem_field -- also no point-count cap, no per-point
+      rate limit, genuinely global 30m coverage) -- checked directly: a
+      real non-US run's elevation fetch took Open-Meteo 156-520s depending
+      on rate-limit retries, for a grid this streams in a handful of
+      seconds instead. Falls back to Open-Meteo only if that bridge is
+      unavailable, the fetch fails outright, or the specific area falls in
+      the small subset of tiles GLO-30 Public hasn't released yet.
     - "usgs_dem_cog": the streamed-COG source only, no fallback -- fails
       outright if the QGIS/GDAL bridge is unavailable or the fetch fails.
     - "usgs": the Elevation Point Query Service only, no fallback -- fails
@@ -875,12 +887,15 @@ def build_real_world_dataset(
                     attempts.append(("usgs", resolution))
                 attempts.append(("open_meteo", resolution))
             else:
-                attempts = [("open_meteo", resolution)]
+                attempts = [("copernicus_dem_cog", resolution), ("open_meteo", resolution)]
 
             def _fetch(source_name: str, attempt_resolution):
                 if source_name == "usgs_dem_cog":
                     from geoai_agent.dem_cog_source import fetch_usgs_dem_cog_field
                     return fetch_usgs_dem_cog_field(bounds, attempt_resolution)
+                if source_name == "copernicus_dem_cog":
+                    from geoai_agent.dem_cog_source import fetch_copernicus_dem_field
+                    return fetch_copernicus_dem_field(bounds, attempt_resolution)
                 if source_name == "usgs":
                     return fetch_usgs_elevation_field(bounds, attempt_resolution)
                 return fetch_open_meteo_field("elevation", bounds, attempt_resolution)

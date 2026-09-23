@@ -97,7 +97,6 @@ from geoai_agent.spatial_analysis import (
 from geoai_agent.streamflow import fetch_nearby_river_gauges, gauges_to_geojson, tag_hotspots_with_river_gauge
 from geoai_agent.ttk_engine import analyze_scalar_field_ttk
 from geoai_agent.real_data import (
-    MAX_GRID_RESOLUTION as _OPEN_METEO_MAX_GRID_RESOLUTION,
     MAX_USGS_GRID_RESOLUTION,
     OPEN_METEO_VARIABLES,
     bounding_box_around_point,
@@ -734,6 +733,17 @@ _AGENT_MAX_RESOLUTION_METERS = 2000
 # payload that's slow/heavy for a browser to render -- this cap protects
 # the backend pipeline's own runtime, not map responsiveness.
 _AGENT_MAX_GRID_RESOLUTION = 500
+# real_data.py's own MAX_GRID_RESOLUTION (80) is what it originally tested/
+# tuned Open-Meteo's batch pacing against, but a real non-US run at 80x63
+# (5,040 points, 51 batches) still took 520s -- Open-Meteo's actual
+# anonymous per-minute limit is evidently tighter than 51 requests/~60s,
+# triggering several 65s retry-waits back to back. Capping lower here (not
+# in real_data.py itself, which other callers also rely on) trades some
+# resolution for a real non-US run actually finishing in demo-reasonable
+# time -- checked directly that this project's TTK/ranking pipeline itself
+# is fast regardless of grid size (~3.5s), so the fetch batch count, not
+# analysis quality, is the actual lever worth pulling here.
+_AGENT_NONUS_MAX_GRID_RESOLUTION = 45
 _AGENT_RAINFALL_SCENARIO = "100yr"
 _AGENT_RUNOFF_COEFFICIENT = 0.5
 # ~0 rather than exactly 0 -- TTK's simplification step compares against
@@ -1301,16 +1311,12 @@ def agent_analyze_stream():
             # uncapped USGS 3DEP DEM COG path (continental US, GDAL-windowed
             # read of a source GeoTIFF -- no point-count cost at all).
             # Outside the continental US, elevation falls back to Open-Meteo
-            # -- a per-point-batched, per-minute-rate-limited API real_data.
-            # py itself only ever tested/tuned up to MAX_GRID_RESOLUTION (80,
-            # imported here as _OPEN_METEO_MAX_GRID_RESOLUTION) -- checked
-            # directly: a 500-cap grid over a non-US city never completed a
-            # single elevation fetch in over 90s, even before hitting a real
-            # rate limit. Capping the resolution request itself, not just
-            # hoping the retry/backoff logic absorbs it, is what actually
-            # keeps a non-US run inside a reasonable wall-clock time.
+            # -- a per-point-batched, rate-limited API. See
+            # _AGENT_NONUS_MAX_GRID_RESOLUTION's own comment above for what
+            # was actually measured live at real_data.py's own tested cap
+            # (80) before this was tightened further.
             agent_max_grid_resolution = (
-                _AGENT_MAX_GRID_RESOLUTION if is_in_continental_us(bounds) else _OPEN_METEO_MAX_GRID_RESOLUTION
+                _AGENT_MAX_GRID_RESOLUTION if is_in_continental_us(bounds) else _AGENT_NONUS_MAX_GRID_RESOLUTION
             )
             resolution = resolution_for_target_spacing_scaled(
                 bounds, target_resolution_meters, max_resolution=agent_max_grid_resolution,
@@ -1514,8 +1520,10 @@ def agent_analyze_stream():
             else:
                 yield line({"type": "step", "label": "No NOAA Atlas 14 coverage for this location -- using the illustrative fallback table"})
 
-            if hydrologic_group:
+            if hydrologic_group and hydrologic_group_source == "measured":
                 yield line({"type": "step", "label": "Soil data loaded (USDA SSURGO)", "detail": {"hydrologic_group": hydrologic_group}})
+            elif hydrologic_group:
+                yield line({"type": "step", "label": "No USDA SSURGO coverage here -- assuming a moderate-infiltration soil group (\"B\") to still derive a land-cover-based runoff coefficient", "detail": {"hydrologic_group": hydrologic_group}})
             else:
                 yield line({"type": "step", "label": "No usable USDA SSURGO soil data for this area -- runoff coefficient will use the flat default"})
 
