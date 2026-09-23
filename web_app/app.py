@@ -25,7 +25,6 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import json
-import math
 import re
 import tempfile
 import time
@@ -792,40 +791,6 @@ _RECOMMENDATION_DROP_HOTSPOT_FIELDS = (
     "aspect_deg", "aspect_compass", "local_relief_m", "flow_length_m",
     "nearby_pipe_count", "nearby_pipe_capacity_m3s",
 )
-
-
-# Cap on how many features a single OSM-derived map layer (roads, water,
-# buildings) embeds before it's systematically downsampled for the map --
-# separate from and much larger than _RECOMMENDATION_TOP_N_HOTSPOTS (that
-# one bounds what's sent to Gemini; this one bounds what's sent to the
-# BROWSER). Checked directly: a real Nairobi run returned 88,258 roads and
-# 640,129 buildings from Overpass -- even after roads_geojson's own
-# coordinate-simplification (see spatial_analysis.py), embedding all of
-# either at that count is still a multi-MB-to-tens-of-MB layer, and
-# per-feature Python overhead (clipping, building the GeoJSON dicts
-# themselves) measurably slows the run before a single byte reaches the
-# client. This is a MAP-visualization concern only -- it never touches
-# risk_score/ranking/the recommendation prompt, which work from the
-# already-small `hotspots` list, not these raw OSM layers.
-_MAP_LAYER_MAX_FEATURES = 15000
-
-
-def _cap_map_layer_features(geojson: dict | None, max_features: int) -> dict | None:
-    """Systematically downsamples geojson's "features" list to at most
-    max_features (every Nth feature, not just the first max_features --
-    OSM's own way-ordering often has spatial locality, e.g. all of one
-    neighborhood's roads returned consecutively, so taking only the head
-    of the list would visually empty out the rest of the map instead of
-    giving an even, representative sample). Passes through None/small
-    layers unchanged. Purely a map-rendering size/speed concern -- doesn't
-    touch anything the actual risk ranking or LLM prompt uses."""
-    if not geojson or not geojson.get("features"):
-        return geojson
-    features = geojson["features"]
-    if len(features) <= max_features:
-        return geojson
-    step = math.ceil(len(features) / max_features)
-    return {**geojson, "features": features[::step]}
 
 
 def _round_floats_for_prompt(obj, ndigits: int = 3):
@@ -2088,7 +2053,6 @@ def agent_analyze_stream():
                         # "nothing drawn extends past the boundary"
                         # consistency every other layer now has.
                         buildings_geojson_data = clip_geojson_to_polygon(buildings_geojson_data, boundary["polygon"])
-                    buildings_geojson_data = _cap_map_layer_features(buildings_geojson_data, _MAP_LAYER_MAX_FEATURES)
 
             yield line({"type": "step", "label": "Applying stormwater/gauge/infrastructure proximity and terrain metrics (aspect, relief, flow length, TWI, building exposure) to ranked hotspots"})
             _enrich_hotspots()
@@ -2120,12 +2084,10 @@ def agent_analyze_stream():
             roads_geojson_data = roads_geojson(osm_infra["roads"]) if osm_infra else None
             if roads_geojson_data and boundary is not None:
                 roads_geojson_data = clip_geojson_to_polygon(roads_geojson_data, boundary["polygon"])
-            roads_geojson_data = _cap_map_layer_features(roads_geojson_data, _MAP_LAYER_MAX_FEATURES)
 
             water_geojson_data = water_geojson(osm_infra["water"]) if osm_infra else None
             if water_geojson_data and boundary is not None:
                 water_geojson_data = clip_geojson_to_polygon(water_geojson_data, boundary["polygon"])
-            water_geojson_data = _cap_map_layer_features(water_geojson_data, _MAP_LAYER_MAX_FEATURES)
 
             scenario_used = flood_result["rainfall_scenario"]
             if boundary is not None:
