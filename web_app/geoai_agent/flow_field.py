@@ -126,6 +126,97 @@ def compute_d8_flow(field: ScalarField) -> dict:
     }
 
 
+def flow_vector_grid(
+    field: ScalarField, boundary_mask=None, max_axis: int = 120,
+) -> dict:
+    """A dense, possibly-downsampled grid of D8 flow-direction unit vectors
+    (u, v) plus a normalized flow-weight per cell, for a client-side
+    animated particle visualization (see static/main.js's FlowAnimation
+    layer) -- a different RENDERING of the same underlying D8 computation
+    flow_field_geojson already uses for its static arrows, not a new data
+    source.
+
+    Unlike flow_field_geojson's sparse "only where a min_t threshold is
+    cleared" arrow sampling, this returns EVERY cell of the (possibly
+    downsampled) grid, including near-zero-weight ones -- an animated
+    particle system needs full-field coverage to interpolate a velocity
+    at whatever point a particle happens to be, not just the handful of
+    high-accumulation points worth drawing a discrete arrow at. "weight"
+    (0-1, log1p-compressed accumulation, same compression flow_field_
+    geojson's arrow LENGTH already uses) is what the client uses instead:
+    particles spawn weighted toward high-weight cells (so they visually
+    concentrate along real channels, matching flow_field_geojson's "empty
+    on ridges, present in channels" look) and move faster/more opaquely
+    where weight is higher -- no hard threshold needed, low-weight areas
+    just naturally get few/no particles.
+
+    max_axis targets (not an exact cap, same stride-rounding approximation
+    flow_field_geojson's own target_arrows_per_axis already uses) roughly
+    this many cells per axis (120 by default), independent of
+    the main analysis grid's own resolution -- a live per-frame canvas
+    animation interpolates between cells every frame regardless of how
+    fine the source grid is, so a coarser grid costs nothing in visual
+    smoothness (bilinear interpolation on the client already smooths
+    between samples) while keeping the payload small: at the cap, at
+    most 120*120=14,400 cells, three float arrays each -- a small
+    fraction of this project's other map-layer payloads.
+
+    Returns {"bounds": [lat_min, lat_max, lon_min, lon_max], "shape":
+    [ny, nx], "u"/"v"/"weight": (ny,nx) nested lists}. u/v/weight are all
+    0 (not NaN) at a local pit or outside boundary_mask -- the client
+    only needs to check weight == 0, not a second sentinel, to know
+    "don't spawn or advect here."""
+    ny, nx = field.shape
+    flow = compute_d8_flow(field)
+    downhill_di, downhill_dj = flow["downhill_di"], flow["downhill_dj"]
+    has_downhill, accumulation_km2 = flow["has_downhill"], flow["accumulation_km2"]
+
+    stride_i = max(1, round(ny / max_axis))
+    stride_j = max(1, round(nx / max_axis))
+    lon_spacing = abs(float(field.xs[1] - field.xs[0])) * stride_j
+    lat_spacing = abs(float(field.ys[1] - field.ys[0])) * stride_i
+
+    rows_i = list(range(0, ny, stride_i))
+    cols_j = list(range(0, nx, stride_j))
+
+    def _valid(i, j):
+        return bool(has_downhill[i, j]) and (boundary_mask is None or boundary_mask[i][j])
+
+    log_mags = [math.log1p(float(accumulation_km2[i, j])) for i in rows_i for j in cols_j if _valid(i, j)]
+    lo = min(log_mags) if log_mags else 0.0
+    hi = max(log_mags) if log_mags else 1.0
+    span = (hi - lo) or 1.0
+
+    u_grid, v_grid, w_grid = [], [], []
+    for i in rows_i:
+        u_row, v_row, w_row = [], [], []
+        for j in cols_j:
+            if not _valid(i, j):
+                u_row.append(0.0)
+                v_row.append(0.0)
+                w_row.append(0.0)
+                continue
+            di, dj = int(downhill_di[i, j]), int(downhill_dj[i, j])
+            vx, vy = dj * lon_spacing, di * lat_spacing
+            norm = math.hypot(vx, vy) or 1.0
+            w = (math.log1p(float(accumulation_km2[i, j])) - lo) / span
+            u_row.append(round(vx / norm, 4))
+            v_row.append(round(vy / norm, 4))
+            w_row.append(round(w, 4))
+        u_grid.append(u_row)
+        v_grid.append(v_row)
+        w_grid.append(w_row)
+
+    lat_min, lat_max = float(field.ys[rows_i[0]]), float(field.ys[rows_i[-1]])
+    lon_min, lon_max = float(field.xs[cols_j[0]]), float(field.xs[cols_j[-1]])
+
+    return {
+        "bounds": [lat_min, lat_max, lon_min, lon_max],
+        "shape": [len(rows_i), len(cols_j)],
+        "u": u_grid, "v": v_grid, "weight": w_grid,
+    }
+
+
 def flow_field_geojson(
     field: ScalarField, boundary_mask=None, target_arrows_per_axis: int = 300, min_t: float = 0.1,
 ) -> dict:

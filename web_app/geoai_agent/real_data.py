@@ -714,6 +714,109 @@ def fetch_population_exposure_field(
     return ScalarField(name="exposure", xs=xs, ys=ys, values=values)
 
 
+_CENSUS_POVERTY_TRACTS_URL = (
+    "https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/"
+    "ACS_Poverty_Status_View_Boundaries/FeatureServer/2/query"
+)
+
+
+def fetch_poverty_rate_field(
+    bounds: tuple[float, float, float, float], resolution: int | tuple[int, int] = GRID_RESOLUTION,
+) -> ScalarField:
+    """Live-fetches US Census-tract poverty rate (percent of population
+    below the federal poverty level, latest ACS 5-year estimate) over
+    `bounds` from Esri's ArcGIS Living Atlas `ACS_Poverty_Status_View_
+    Boundaries` FeatureServer (tract-level sublayer, id 2), and rasterizes
+    it onto the analysis grid -- same STRtree point-in-polygon technique
+    fetch_population_exposure_field above already uses for block-group
+    population, just one geography level coarser (tract, not block group:
+    this Living Atlas item doesn't publish poverty at block-group scale --
+    ACS's own margin-of-error requirements get too wide at that fine a
+    geography for a 1-variable estimate like poverty status anyway, so
+    tract is the standard scale this measure is normally published at).
+
+    Same "no API key" reasoning as fetch_population_exposure_field: this is
+    an Esri-hosted mirror of the same underlying ACS data, not the Census
+    Bureau's own signup-key-gated API. `B17020_calc_pctPovE` is Esri's own
+    precomputed "percent below poverty level" field (verified live: real
+    sample values like 4.5, 19.8, 9.0 -- already a 0-100 percentage, not a
+    0-1 fraction) -- used as-is, no derivation needed from the underlying
+    raw population/poverty-count fields also present on this layer.
+
+    Raises RuntimeError if the service is unreachable or returns no tracts
+    for this area (no coverage outside the US, same as the population
+    fetch) -- callers should catch this and treat it as "no poverty-rate
+    data for this run", the same graceful-degrade contract every other
+    optional layer in this project follows."""
+    from shapely.geometry import Point, Polygon
+    from shapely.strtree import STRtree
+
+    lat_min, lat_max, lon_min, lon_max = bounds
+    query = urllib.parse.urlencode({
+        "geometry": f"{lon_min},{lat_min},{lon_max},{lat_max}",
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": "4326",
+        # Explicit, not left to the service default: checked live, this
+        # layer's native storage SR is Web Mercator (3857), unlike the
+        # population block-groups layer above (whose default output
+        # already happens to be 4326) -- omitting this returned real tract
+        # polygons in meters, silently failing every point-in-polygon test
+        # below (a plausible-looking (ny,nx) all-zero field, not a crash).
+        "outSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "GEOID,B17020_calc_pctPovE",
+        "returnGeometry": "true",
+        "f": "json",
+    })
+    try:
+        with urllib.request.urlopen(f"{_CENSUS_POVERTY_TRACTS_URL}?{query}", timeout=20) as resp:
+            payload = json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
+        raise RuntimeError(f"US Census poverty-rate tract service request failed: {exc}") from exc
+
+    features = payload.get("features") or []
+    if not features:
+        raise RuntimeError(
+            "no US Census tracts returned for this area (outside US coverage, "
+            "or an area with no tract polygons at all)"
+        )
+
+    polygons = []
+    poverty_pcts = []
+    for feature in features:
+        attrs = feature.get("attributes", {})
+        pct_pov = attrs.get("B17020_calc_pctPovE")
+        rings = (feature.get("geometry") or {}).get("rings")
+        if pct_pov is None or not rings:
+            continue
+        try:
+            polygon = Polygon(rings[0], holes=rings[1:]) if len(rings) > 1 else Polygon(rings[0])
+        except Exception:
+            continue
+        if not polygon.is_valid or polygon.is_empty:
+            continue
+        polygons.append(polygon)
+        poverty_pcts.append(float(pct_pov))
+
+    if not polygons:
+        raise RuntimeError("US Census tracts were returned but none had usable poverty-rate/geometry data")
+
+    tree = STRtree(polygons)
+    xs, ys = _grid(bounds, resolution)
+    xx, yy = np.meshgrid(xs, ys)
+    values = np.zeros(xx.shape, dtype=float)
+
+    for row in range(xx.shape[0]):
+        for col in range(xx.shape[1]):
+            point = Point(float(xx[row, col]), float(yy[row, col]))
+            candidates = tree.query(point, predicate="within")
+            if len(candidates):
+                values[row, col] = poverty_pcts[int(candidates[0])]
+            # else: no tract at this node (e.g. open water) -- left at 0.0
+
+    return ScalarField(name="poverty_rate", xs=xs, ys=ys, values=values)
+
+
 _WORLDPOP_IMAGE_SERVER_URL = "https://worldpop.arcgis.com/arcgis/rest/services/WorldPop_Population_Density_100m/ImageServer"
 # WorldPop's own NoData sentinel for this service (the standard float32
 # "negative max" convention) -- confirmed live (a real exportImage request

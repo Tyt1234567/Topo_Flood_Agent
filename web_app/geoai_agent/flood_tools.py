@@ -26,6 +26,17 @@ flood-prone sink, and scored/ranked using
 - Exposure (optional): a population/asset density layer sampled at the
   basin, if the caller has one -- weight 0 (excluded) if not supplied,
   rather than inventing a number.
+- Poverty (optional): US Census-tract poverty rate sampled at the basin
+  (geoai_agent.real_data.fetch_poverty_rate_field), same neutral-0.5
+  fallback as exposure when not supplied. A genuinely different dimension
+  from exposure/population density -- exposure measures HOW MANY people/
+  structures are there, poverty measures how financially able the people
+  who ARE there are to absorb, evacuate from, or recover from a flood
+  (the classic physical-exposure vs. social-vulnerability split in
+  disaster-risk literature, e.g. Cutter et al.'s hazards-of-place model,
+  and the same distinction CDC's own Social Vulnerability Index -- already
+  a separate, non-scored context layer elsewhere in this project -- draws
+  between its "exposure" and "socioeconomic status" themes).
 
 Runoff coefficient itself can also come from real data now: pass
 `land_cover_grid` (geoai_agent.land_cover.fetch_nlcd_landcover_grid) and
@@ -38,14 +49,15 @@ whole run. A basin with no usable land-cover data (or if either input is
 missing) falls back to the flat `runoff_coefficient` parameter exactly as
 before -- see each hotspot's own "runoff_coefficient_source".
 
-All five factor weights are caller-adjustable (WEIGHT_PRESETS gives named
+All six factor weights are caller-adjustable (WEIGHT_PRESETS gives named
 starting points, entropy_weights below gives an objective data-driven
 alternative, and a caller/the frontend's Modify-weights sliders can pass
 any custom {"topological", "contributing_area", "rainfall", "slope",
-"exposure"} dict directly) -- this is the HITL "life-safety vs. economic
-recovery" control from the project brief: an emergency planner can shift
-weight toward exposure/topological susceptibility, or toward contributing
-area/rainfall if the goal is engineering capacity planning instead.
+"exposure", "poverty"} dict directly) -- this is the HITL "life-safety vs.
+economic recovery" control from the project brief: an emergency planner
+can shift weight toward exposure/poverty/topological susceptibility, or
+toward contributing area/rainfall if the goal is engineering capacity
+planning instead.
 _DEFAULT_WEIGHTS and every WEIGHT_PRESETS entry are an expert-defined
 PRIORITIZATION scheme, not weights fit or validated against historical
 flood-outcome data -- risk_score is a transparent, reproducible composite
@@ -54,23 +66,23 @@ probability of flooding. See report.py's "How risk_score is computed"
 section for the exact per-factor formulas and this same caveat, surfaced
 to end users.
 
-_DEFAULT_WEIGHTS is not pulled out of thin air: grouping this project's
-five factors against the nine physical factors used in a real published
-AHP flood-hazard-index study -- Mohammed, Z.T., Hussein, L.Y. & Abood,
-M.H., "Potential Flood Hazard Mapping Based on GIS and Analytical
-Hierarchy Process," Journal of Water Management Modeling 32, C528 (2024),
-https://doi.org/10.14796/JWMM.C528, a Diyala governorate, Iraq case study
--- lands close to that paper's own AHP-derived weights: (distance-to-river
-16.0% + elevation 13.5%) = 29.5% maps to this project's "topological"
-susceptibility (30%); (TWI 15.2% + drainage density 10.6%) = 25.8% maps to
-"contributing_area" (25%); their "rainfall" 15.1% is in the same range as
-this project's 20%; "slope" 11.1% is in the same range as this project's
-15%; (LULC 7.0% + NDVI 6.2%) = 13.2% is in the same range as "exposure"
-10% (though LULC/NDVI there measure ground cover's effect on runoff, not
-population/building exposure -- a genuinely different concept this
-project's exposure_score is the only one of the five actually measuring).
-This is a real, checkable anchor point for "is 30/25/20/15/10 a
-reasonable ballpark," not proof this project's specific weights are
+_DEFAULT_WEIGHTS's first five factors are not pulled out of thin air:
+grouping this project's factors against the nine physical factors used in
+a real published AHP flood-hazard-index study -- Mohammed, Z.T., Hussein,
+L.Y. & Abood, M.H., "Potential Flood Hazard Mapping Based on GIS and
+Analytical Hierarchy Process," Journal of Water Management Modeling 32,
+C528 (2024), https://doi.org/10.14796/JWMM.C528, a Diyala governorate,
+Iraq case study -- lands close to that paper's own AHP-derived weights:
+(distance-to-river 16.0% + elevation 13.5%) = 29.5% maps to this
+project's "topological" susceptibility (27%); (TWI 15.2% + drainage
+density 10.6%) = 25.8% maps to "contributing_area" (22%); their
+"rainfall" 15.1% is in the same range as this project's 18%; "slope"
+11.1% is in the same range as this project's 13%; (LULC 7.0% + NDVI
+6.2%) = 13.2% is in the same range as "exposure" 10% (though LULC/NDVI
+there measure ground cover's effect on runoff, not population/building
+exposure -- a genuinely different concept this project's exposure_score
+actually measures). This is a real, checkable anchor point for "is this
+ballpark reasonable," not proof this project's specific weights are
 correct -- a single study from one river basin doesn't generalize, the
 factor groupings above are an approximate correspondence rather than an
 exact match (this project's factors come from Morse-theory basin
@@ -79,6 +91,11 @@ other published AHP flood studies put rainfall's weight anywhere from
 roughly 8% to 55% depending on how much precipitation actually varies
 across THAT study's own area -- there is no single literature-consensus
 number to transplant here even if the factor definitions matched exactly.
+"poverty" (10% in _DEFAULT_WEIGHTS) has no anchor in that AHP study at
+all -- it doesn't model social vulnerability as a factor -- so its weight
+here is this project's own judgment call, not backed by that citation the
+way the other five's ballpark is; see the class docstring's "Poverty"
+bullet above for the (different) literature this factor draws on instead.
 
 A separate, and more directly decisive, fact about the rainfall weight
 specifically: RAINFALL_SCENARIOS applies ONE selected storm uniformly to
@@ -87,7 +104,7 @@ single run. Adding the same w["rainfall"] * rainfall_score term to every
 basin's risk_score shifts every basin's score by the same amount, which
 cannot change their relative ORDER -- verified by hand: re-ranking the
 same basins with rainfall's raw weight set to 0%, 20%, and 55% (holding
-the other four weights' relative proportions fixed) produces the exact
+the other five weights' relative proportions fixed) produces the exact
 same ranking every time. So in preset/custom mode, rainfall's displayed
 weight percentage is real (it changes risk_score's absolute magnitude,
 and DOES matter if risk_score is ever compared ACROSS different storm
@@ -134,19 +151,27 @@ RAINFALL_SCENARIOS = {
 _MAX_RAINFALL_INTENSITY = max(s["intensity_mm_per_hr"] for s in RAINFALL_SCENARIOS.values())
 
 _DEFAULT_WEIGHTS = {
-    "topological": 0.30, "contributing_area": 0.25, "rainfall": 0.20, "slope": 0.15, "exposure": 0.10,
+    "topological": 0.27, "contributing_area": 0.22, "rainfall": 0.18, "slope": 0.13, "exposure": 0.10,
+    "poverty": 0.10,
 }
 # Named HITL starting points -- emergency planners/community reps pick one
 # of these (or hand-tune _DEFAULT_WEIGHTS-shaped overrides) to shift what
 # "highest risk" means, per the project brief's life-safety-vs-recovery
-# trade-off control.
+# trade-off control. life_safety splits its exposure-heavy weight between
+# exposure (how many people/structures) and poverty (how able those people
+# are to evacuate/recover) rather than folding poverty into exposure's own
+# number -- infrastructure_protection zeroes BOTH out, same as it already
+# zeroed exposure alone before poverty existed, since neither is relevant
+# to an engineering-capacity-planning objective.
 WEIGHT_PRESETS = {
     "balanced": _DEFAULT_WEIGHTS,
     "life_safety": {
-        "topological": 0.25, "contributing_area": 0.15, "rainfall": 0.15, "slope": 0.10, "exposure": 0.35,
+        "topological": 0.25, "contributing_area": 0.15, "rainfall": 0.15, "slope": 0.10, "exposure": 0.20,
+        "poverty": 0.15,
     },
     "infrastructure_protection": {
         "topological": 0.30, "contributing_area": 0.30, "rainfall": 0.25, "slope": 0.15, "exposure": 0.0,
+        "poverty": 0.0,
     },
 }
 
@@ -285,7 +310,7 @@ def rational_method_runoff(runoff_coefficient: float, intensity_mm_per_hr: float
     return runoff_coefficient * intensity_mm_per_hr * area_km2 / 3.6
 
 
-_ENTROPY_FACTOR_KEYS = ("topological", "contributing_area", "rainfall", "slope", "exposure")
+_ENTROPY_FACTOR_KEYS = ("topological", "contributing_area", "rainfall", "slope", "exposure", "poverty")
 
 
 def entropy_weights(score_matrix: dict[str, list[float]]) -> dict[str, float]:
@@ -391,6 +416,7 @@ def rank_flood_basins(
     runoff_coefficient: float = 0.5,
     slope_field: ScalarField | None = None,
     exposure_field: ScalarField | None = None,
+    poverty_field: ScalarField | None = None,
     boundary_mask: np.ndarray | None = None,
     land_cover_grid: np.ndarray | None = None,
     hydrologic_group: str | None = None,
@@ -413,8 +439,8 @@ def rank_flood_basins(
     so reusing the static table's own max would silently mis-normalize.
 
     weights: a WEIGHT_PRESETS name, a custom {"topological",
-    "contributing_area", "rainfall", "slope", "exposure"} dict (need not
-    sum to 1 -- renormalized), None for the "balanced" preset, or the
+    "contributing_area", "rainfall", "slope", "exposure", "poverty"} dict
+    (need not sum to 1 -- renormalized), None for the "balanced" preset, or the
     literal string "entropy" to use entropy_weights (above) instead of any
     named policy preset -- weights computed OBJECTIVELY from how much each
     factor actually varies across this run's own significant basins, no
@@ -429,6 +455,12 @@ def rank_flood_basins(
     caller-supplied dict that is neither of those -- e.g. the frontend's
     Modify-weights sliders, a person's own hand-picked numbers, not backed
     by either an expert-named policy or the entropy calculation).
+
+    poverty_field: a US Census-tract poverty-rate layer (geoai_agent.
+    real_data.fetch_poverty_rate_field) sampled at each basin, same
+    min-max-normalized-across-this-run's-basins treatment as exposure_
+    field. Left out (None, the default), poverty_score is the same neutral
+    0.5 every unsupplied optional factor here falls back to.
 
     boundary_mask: a boolean (ny, nx) grid (see boundary.
     grid_inside_polygon_mask), True where a cell is actually inside the
@@ -569,6 +601,14 @@ def rank_flood_basins(
         else:
             exposure_score = 0.5  # neutral -- no exposure layer supplied for this run
 
+        if poverty_field is not None:
+            pov_here = float(poverty_field.values[i, j])
+            pov_min, pov_max = float(poverty_field.values.min()), float(poverty_field.values.max())
+            pov_range = (pov_max - pov_min) or 1.0
+            poverty_score = (pov_here - pov_min) / pov_range
+        else:
+            poverty_score = 0.5  # neutral -- no poverty layer supplied for this run
+
         basin_runoff_coefficient = runoff_coefficient
         runoff_coefficient_source = "constant"
         if use_land_cover:
@@ -599,6 +639,8 @@ def rank_flood_basins(
             "rainfall_score": rainfall_score,
             "exposure_score": exposure_score,
             "exposure_layer_available": exposure_field is not None,
+            "poverty_score": poverty_score,
+            "poverty_layer_available": poverty_field is not None,
             "slope_layer_available": slope_field is not None,
             "runoff_coefficient": basin_runoff_coefficient,
             "runoff_coefficient_source": runoff_coefficient_source,
@@ -614,6 +656,7 @@ def rank_flood_basins(
             "rainfall": [h["rainfall_score"] for h in hotspots],
             "slope": [h["slope_score"] for h in hotspots],
             "exposure": [h["exposure_score"] for h in hotspots],
+            "poverty": [h["poverty_score"] for h in hotspots],
         })
 
     for h in hotspots:
@@ -623,6 +666,7 @@ def rank_flood_basins(
             + w["rainfall"] * h["rainfall_score"]
             + w["slope"] * h["slope_score"]
             + w["exposure"] * h["exposure_score"]
+            + w["poverty"] * h["poverty_score"]
         )
 
     hotspots.sort(key=lambda h: h["risk_score"], reverse=True)
@@ -667,6 +711,7 @@ def compute_expected_annual_runoff(
     runoff_coefficient: float = 0.5,
     slope_field: ScalarField | None = None,
     exposure_field: ScalarField | None = None,
+    poverty_field: ScalarField | None = None,
     boundary_mask: np.ndarray | None = None,
     land_cover_grid: np.ndarray | None = None,
     hydrologic_group: str | None = None,
@@ -696,9 +741,9 @@ def compute_expected_annual_runoff(
     Every parameter besides `elevation_field`/`morse_result` is passed
     straight through to each of the six rank_flood_basins calls unchanged
     (same weights/runoff_coefficient/slope_field/exposure_field/
-    boundary_mask/land_cover_grid/hydrologic_group/land_cover_cn_table
-    every time) -- only `rainfall_scenario` varies call to call, driven by
-    this function itself.
+    poverty_field/boundary_mask/land_cover_grid/hydrologic_group/
+    land_cover_cn_table every time) -- only `rainfall_scenario` varies call
+    to call, driven by this function itself.
 
     Returns {"basins": [{"catchment_id", "grid_index", "coords",
     "expected_annual_runoff_m3s", "per_scenario": {"2yr": <m3s>, ...}},
@@ -712,7 +757,7 @@ def compute_expected_annual_runoff(
         per_scenario_results[scenario_key] = rank_flood_basins(
             elevation_field, morse_result, rainfall_scenario=scenario_key, rainfall_table=rainfall_table,
             weights=weights, runoff_coefficient=runoff_coefficient, slope_field=slope_field,
-            exposure_field=exposure_field, boundary_mask=boundary_mask,
+            exposure_field=exposure_field, poverty_field=poverty_field, boundary_mask=boundary_mask,
             land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
             land_cover_cn_table=land_cover_cn_table,
         )

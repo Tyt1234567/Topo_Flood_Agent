@@ -30,7 +30,7 @@ document.querySelectorAll(".modal-overlay").forEach((overlay) => {
 // time a new "done" event arrives, rather than creating a new map per run.
 
 let persistentMap = null;
-let mapLayers = { heat: null, allMinima: null, boundary: null, catchment: null, catchmentBuildings: null, reportFocus: null, femaFlood: null, pipes: null, gauges: null, buildings: null, flowField: null, exposure: null, landCover: null, roads: null, water: null, rainfallSoil: null };
+let mapLayers = { heat: null, allMinima: null, boundary: null, catchment: null, catchmentBuildings: null, reportFocus: null, femaFlood: null, pipes: null, gauges: null, buildings: null, flowField: null, exposure: null, poverty: null, landCover: null, roads: null, water: null, rainfallSoil: null };
 let mapLayerControl = null;
 let mapLegendControl = null;
 let mapSliderControl = null;
@@ -152,9 +152,184 @@ function persistenceRadius(persistenceM, maxP, minR, maxR) {
   return minR + frac * (maxR - minR);
 }
 
+// Animated flowing-particle rendering of D8 downhill flow (geoai_agent/
+// flow_field.py's flow_vector_grid) -- a live weather-map-style ("wind map")
+// continuous field instead of a handful of static arrows (the downloadable
+// report keeps the static-arrow rendering, unchanged, in its own embedded
+// JS). A plain Leaflet Layer (onAdd/onRemove) so it plugs into the existing
+// overlay checkbox / clearMapLayers cleanup exactly like every other layer
+// here -- removing it from the map cancels its own animation frame and
+// detaches its canvas, no special-casing needed anywhere else.
+// Live-weather-map ("wind map") style: density AND speed both vary
+// continuously with each spot's own flow weight -- dense/fast where a lot
+// of drainage area accumulates, sparse/slow (but never entirely empty)
+// elsewhere -- rather than either a hard on/off cutoff or a single fixed
+// speed everywhere.
+const FLOW_PARTICLE_COUNT = 1800;
+const FLOW_TRAIL_LENGTH = 7;
+const FLOW_BASE_SPEED_PX = 0.15; // px/frame at the min-weight floor -- slow drift, not a hard stop
+const FLOW_MAX_SPEED_PX = 1.0;   // px/frame at weight=1 (the single busiest channel)
+const FLOW_MIN_WEIGHT = 0.03;    // below this, treat as "no real flow here" -- low enough to cover most of the real drainage network, not just its handful of busiest channels
+
+class FlowAnimationLayer extends L.Layer {
+  constructor(vectorField, options) {
+    super(options);
+    this._vf = vectorField;
+    this._particles = [];
+  }
+
+  onAdd(map) {
+    this._map = map;
+    const size = map.getSize();
+    this._canvas = L.DomUtil.create("canvas", "flow-animation-canvas");
+    this._canvas.width = size.x;
+    this._canvas.height = size.y;
+    Object.assign(this._canvas.style, {
+      position: "absolute", left: "0", top: "0", zIndex: 450, pointerEvents: "none",
+    });
+    map.getContainer().appendChild(this._canvas);
+    this._ctx = this._canvas.getContext("2d");
+
+    this._onResize = () => {
+      const s = map.getSize();
+      this._canvas.width = s.x;
+      this._canvas.height = s.y;
+    };
+    map.on("resize", this._onResize);
+
+    this._particles = [];
+    for (let k = 0; k < FLOW_PARTICLE_COUNT; k++) this._particles.push(this._spawn());
+
+    this._running = true;
+    this._tick = this._tick.bind(this);
+    this._raf = requestAnimationFrame(this._tick);
+    return this;
+  }
+
+  onRemove(map) {
+    this._running = false;
+    if (this._raf) cancelAnimationFrame(this._raf);
+    map.off("resize", this._onResize);
+    if (this._canvas && this._canvas.parentNode) this._canvas.parentNode.removeChild(this._canvas);
+    this._canvas = null;
+    return this;
+  }
+
+  // Bilinear-interpolated (u, v, weight) at an arbitrary (lon, lat), or null
+  // outside the vector field's own bounds entirely (a particle that wanders
+  // there is off the analysis grid, not just somewhere with little flow).
+  _sample(lon, lat) {
+    const vf = this._vf;
+    const [latMin, latMax, lonMin, lonMax] = vf.bounds;
+    const [ny, nx] = vf.shape;
+    if (lon < lonMin || lon > lonMax || lat < latMin || lat > latMax) return null;
+    const fx = ((lon - lonMin) / (lonMax - lonMin || 1)) * (nx - 1);
+    const fy = ((lat - latMin) / (latMax - latMin || 1)) * (ny - 1);
+    const j0 = Math.min(nx - 2, Math.max(0, Math.floor(fx)));
+    const i0 = Math.min(ny - 2, Math.max(0, Math.floor(fy)));
+    const tx = fx - j0, ty = fy - i0;
+    const lerp = (grid) => {
+      const a = grid[i0][j0], b = grid[i0][j0 + 1], c = grid[i0 + 1][j0], d = grid[i0 + 1][j0 + 1];
+      const top = a + (b - a) * tx, bot = c + (d - c) * tx;
+      return top + (bot - top) * ty;
+    };
+    return { u: lerp(vf.u), v: lerp(vf.v), weight: lerp(vf.weight) };
+  }
+
+  // A fresh particle position -- a point clearing FLOW_MIN_WEIGHT is
+  // accepted with probability that rises smoothly from FLOW_SPAWN_FLOOR at
+  // the threshold up to 1.0 at weight=1, not a flat "anything above the
+  // bar is equally likely" cutoff. That's what actually produces the "some
+  // spots dense, some sparse" look: a bare-minimum tributary still gets
+  // occasional particles (never truly empty), while a real busy channel
+  // gets particles landing there far more often, without needing a
+  // strongly concentrating power curve (weight^2 was tried and over-
+  // corrected the other way, starving every tributary next to a dominant
+  // channel almost completely). Speed/opacity in _tick ALSO scale with
+  // weight on top of this, so busier channels read as both denser and
+  // faster-flowing, matching a live weather-map wind field.
+  _spawn() {
+    const vf = this._vf;
+    const [latMin, latMax, lonMin, lonMax] = vf.bounds;
+    const FLOW_SPAWN_FLOOR = 0.35;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const lon = lonMin + Math.random() * (lonMax - lonMin);
+      const lat = latMin + Math.random() * (latMax - latMin);
+      const s = this._sample(lon, lat);
+      if (!s || s.weight <= FLOW_MIN_WEIGHT) continue;
+      const acceptProb = FLOW_SPAWN_FLOOR + (1 - FLOW_SPAWN_FLOOR) * Math.min(1, s.weight);
+      if (Math.random() < acceptProb) {
+        return { lon, lat, trail: [], age: 60 + Math.floor(Math.random() * 120) };
+      }
+    }
+    // Fell through every attempt (a mostly-flat/no-flow area) -- park this
+    // particle off-grid with a 1-frame lifespan rather than drawing it
+    // somewhere meaningless; it gets a fresh shot at a real spot next tick.
+    return { lon: lonMin - 1, lat: latMin - 1, trail: [], age: 1 };
+  }
+
+  _tick() {
+    if (!this._running) return;
+    this._raf = requestAnimationFrame(this._tick);
+    const map = this._map, ctx = this._ctx;
+    ctx.clearRect(0, 0, this._canvas.width, this._canvas.height);
+
+    for (let k = 0; k < this._particles.length; k++) {
+      let p = this._particles[k];
+      const s = this._sample(p.lon, p.lat);
+      if (!s || s.weight <= FLOW_MIN_WEIGHT || p.age <= 0) {
+        p = this._spawn();
+        this._particles[k] = p;
+        continue;
+      }
+
+      // Zoom-independent visual speed: convert a target PIXEL step into the
+      // current view's degrees-per-pixel (recomputed every frame -- cheap,
+      // and self-corrects across pans/zooms with no separate event wiring).
+      // "+1 pixel right" / "-1 pixel up" so both deltas come out positive in
+      // the same sense as u (east-positive) and v (north-positive) already
+      // are server-side -- no sign flip to remember at the call site below.
+      const c0 = map.latLngToContainerPoint([p.lat, p.lon]);
+      const degPerPxLon = map.containerPointToLatLng([c0.x + 1, c0.y]).lng - p.lon;
+      const degPerPxLat = map.containerPointToLatLng([c0.x, c0.y - 1]).lat - p.lat;
+      const pxSpeed = FLOW_BASE_SPEED_PX + s.weight * (FLOW_MAX_SPEED_PX - FLOW_BASE_SPEED_PX);
+
+      p.trail.push([p.lon, p.lat]);
+      if (p.trail.length > FLOW_TRAIL_LENGTH) p.trail.shift();
+      p.lon += s.u * pxSpeed * degPerPxLon;
+      p.lat += s.v * pxSpeed * degPerPxLat;
+      p.age -= 1;
+
+      if (p.trail.length >= 2) {
+        ctx.beginPath();
+        for (let t = 0; t < p.trail.length; t++) {
+          const pt = map.latLngToContainerPoint([p.trail[t][1], p.trail[t][0]]);
+          if (t === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
+        }
+        // A dark halo stroke first, then a semi-transparent WHITE stroke on
+        // top. Checked directly against the real (light gray/tan) OSM
+        // basemap: a halo that merely scales down FROM the white line's own
+        // opacity was much too faint to read at all against light map
+        // areas -- the halo needs its OWN strong, mostly weight-independent
+        // opacity floor to actually do its job (create contrast), not just
+        // a token shadow. White opacity still scales with weight so busier
+        // channels read as more solid, not just faster/denser.
+        const alpha = 0.4 + 0.5 * s.weight;
+        const haloAlpha = 0.5 + 0.35 * s.weight;
+        ctx.strokeStyle = `rgba(0,0,0,${haloAlpha.toFixed(2)})`;
+        ctx.lineWidth = 3.2;
+        ctx.stroke();
+        ctx.strokeStyle = `rgba(255,255,255,${alpha.toFixed(2)})`;
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+      }
+    }
+  }
+}
+
 function clearMapLayers() {
   Object.values(mapLayers).forEach((layer) => { if (layer) persistentMap.removeLayer(layer); });
-  mapLayers = { heat: null, allMinima: null, boundary: null, catchment: null, catchmentBuildings: null, reportFocus: null, femaFlood: null, pipes: null, gauges: null, buildings: null, flowField: null, exposure: null, landCover: null, roads: null, water: null, rainfallSoil: null };
+  mapLayers = { heat: null, allMinima: null, boundary: null, catchment: null, catchmentBuildings: null, reportFocus: null, femaFlood: null, pipes: null, gauges: null, buildings: null, flowField: null, exposure: null, poverty: null, landCover: null, roads: null, water: null, rainfallSoil: null };
   if (mapLayerControl) { persistentMap.removeControl(mapLayerControl); mapLayerControl = null; }
   if (mapLegendControl) { persistentMap.removeControl(mapLegendControl); mapLegendControl = null; }
   if (mapSliderControl) { persistentMap.removeControl(mapSliderControl); mapSliderControl = null; }
@@ -332,24 +507,17 @@ function populateMap(mapData) {
     overlays["Buildings (OpenStreetMap, counted toward exposure)"] = mapLayers.buildings;
   }
 
-  // D8 downhill flow-direction arrows (geoai_agent/flow_field.py) -- plain
-  // raster hydrology computed straight from the elevation grid, independent
-  // of TTK/persistence entirely. Arrow length already encodes each sampled
-  // cell's own flow_accumulation_km2 (short = little water passes through
-  // that spot, long = a lot does) -- styling here only needs color/opacity,
-  // the size itself is baked into the geometry server-side.
-  if (mapData.flow_field_geojson) {
-    mapLayers.flowField = L.geoJSON(mapData.flow_field_geojson, {
-      style: (f) => {
-        const t = f.properties.t;
-        return { color: "#c0392b", weight: 1 + t * 2.5, opacity: 0.45 + t * 0.5 };
-      },
-      onEachFeature: (f, layer) => {
-        const p = f.properties;
-        layer.bindPopup(`<b>Flow direction</b><br>Accumulated drainage area: ${p.flow_accumulation_km2.toFixed(3)} km&sup2;`);
-      },
-    });
-    overlays["Flow direction (drainage volume)"] = mapLayers.flowField;
+  // D8 downhill flow, animated (geoai_agent/flow_field.py's flow_vector_grid
+  // + FlowAnimationLayer above) -- plain raster hydrology computed straight
+  // from the elevation grid, independent of TTK/persistence entirely.
+  // Particles flow faster and denser where a spot's own accumulated
+  // drainage area is higher -- a live weather-map-style rendering of the
+  // same signal flow_field_geojson's static arrow length used to encode
+  // (that static version still exists, unchanged, in the downloadable
+  // report -- see report.py).
+  if (mapData.flow_vector_field) {
+    mapLayers.flowField = new FlowAnimationLayer(mapData.flow_vector_field);
+    overlays["Flow direction (drainage volume, animated)"] = mapLayers.flowField;
   }
 
   // Population density (US Census block groups, or a user upload -- see
@@ -360,6 +528,18 @@ function populateMap(mapData) {
       style: (f) => ({ fillColor: f.properties.color, color: f.properties.color, weight: 0, fillOpacity: 0.75 }),
     });
     overlays["Population density (exposure)"] = mapLayers.exposure;
+  }
+
+  // US Census-tract poverty rate (geoai_agent/real_data.py's
+  // fetch_poverty_rate_field) -- a distinct socioeconomic-vulnerability
+  // factor from population density above, now one of the Flood Priority
+  // Score's six weighted factors (see WEIGHT_FACTORS below).
+  if (mapData.poverty_geojson) {
+    mapLayers.poverty = L.geoJSON(mapData.poverty_geojson, {
+      style: (f) => ({ fillColor: f.properties.color, color: f.properties.color, weight: 0, fillOpacity: 0.75 }),
+      onEachFeature: (f, layer) => layer.bindPopup(`<b>Poverty rate</b><br>${f.properties.value.toFixed(1)}%`),
+    });
+    overlays["Poverty rate"] = mapLayers.poverty;
   }
 
   // NLCD classified land cover (geoai_agent/land_cover.py) -- categorical,
@@ -503,10 +683,13 @@ function populateMap(mapData) {
         : "") +
       (layerIsVisible(mapLayers.flowField)
         ? `<div style="margin-top:6px;"><strong>Flow direction</strong> (D8, computed from elevation)</div>` +
-          `<div>Arrow length = accumulated drainage area at that spot -- short where little water passes through, long where a lot does</div>`
+          `<div><span style="display:inline-block;width:10px;height:2px;background:#fff;border-top:1px solid rgba(0,0,0,0.55);border-bottom:1px solid rgba(0,0,0,0.55);"></span> animated particles (white, dark halo on the map) -- denser and faster-flowing where accumulated drainage area is higher, sparser and slower on ridges and flat ground</div>`
         : "") +
       (layerIsVisible(mapLayers.exposure)
         ? `<div style="margin-top:6px;"><strong>Population density</strong> (US Census block groups, live)</div>`
+        : "") +
+      (layerIsVisible(mapLayers.poverty)
+        ? `<div style="margin-top:6px;"><strong>Poverty rate</strong> (US Census tracts, live)</div>`
         : "") +
       (layerIsVisible(mapLayers.landCover)
         ? `<div style="margin-top:6px;"><strong>Land cover</strong> (NLCD, categorical -- click a cell for its class)</div>`
@@ -852,7 +1035,7 @@ document.getElementById("modify-data-submit").addEventListener("click", () => {
 
 // -- modify-weights modal: re-run with hand-set risk-factor weights ---------
 // Triggered by the "Modify" button on the "Flood ranking complete" step row.
-// Five linked sliders that always sum to 100% (dragging one proportionally
+// Six linked sliders that always sum to 100% (dragging one proportionally
 // rescales the other four, same UX as e.g. a budget-allocation slider set) --
 // applying them sends weighting_method=custom + custom_weights=<json> instead
 // of the default entropy weighting, for this and every subsequent re-run of
@@ -864,12 +1047,13 @@ const WEIGHT_FACTORS = [
   { key: "rainfall", label: "Rainfall intensity" },
   { key: "slope", label: "Slope" },
   { key: "exposure", label: "Exposure (population/buildings)" },
+  { key: "poverty", label: "Poverty rate (Census tracts)" },
 ];
 let modifyWeightsState = null; // {key: percent 0-100, ...}, always summing to 100
 
 function openModifyWeightsModal() {
   const current = (qaContext && qaContext.weights) || {
-    topological: 0.30, contributing_area: 0.25, rainfall: 0.20, slope: 0.15, exposure: 0.10,
+    topological: 0.27, contributing_area: 0.22, rainfall: 0.18, slope: 0.13, exposure: 0.10, poverty: 0.10,
   };
   modifyWeightsState = {};
   WEIGHT_FACTORS.forEach((f) => { modifyWeightsState[f.key] = (current[f.key] || 0) * 100; });
@@ -879,7 +1063,7 @@ function openModifyWeightsModal() {
 }
 
 // Redistributes `delta` (the change just made to `changedKey`) across the
-// other four factors in proportion to their CURRENT weights, so relative
+// other five factors in proportion to their CURRENT weights, so relative
 // priorities among the untouched sliders are preserved; a final renormalize
 // pass corrects any rounding/clamping drift back to exactly 100.
 function redistributeWeights(changedKey, newValue, state) {
@@ -958,7 +1142,7 @@ let pendingExposureFile = null; // only ever set via the post-run "Modify" flow 
 let qaContext = null;
 let chatHistory = [];
 let lastAnalyzedPlace = null;
-let lastCustomWeights = null; // {topological, contributing_area, rainfall, slope, exposure} set via the Modify-weights sliders, or null
+let lastCustomWeights = null; // {topological, contributing_area, rainfall, slope, exposure, poverty} set via the Modify-weights sliders, or null
 let currentRunId = null; // set from the stream's "run_id" event, cleared on done/error -- see runAgentAnalysis and the #interject-send handler below
 let checkpointCountdownTimer = null; // setInterval id for the currently-open checkpoint's countdown, or null -- see openCheckpointUI/closeCheckpointUI
 

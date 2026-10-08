@@ -194,7 +194,8 @@ def _webmap_fragment(
     pipes_geojson: dict | None = None, gauges_geojson: dict | None = None,
     buildings_geojson: dict | None = None, boundary_mask=None,
     flow_field_geojson_data: dict | None = None,
-    exposure_geojson_data: dict | None = None, land_cover_geojson_data: dict | None = None,
+    exposure_geojson_data: dict | None = None, poverty_geojson_data: dict | None = None,
+    land_cover_geojson_data: dict | None = None,
     roads_geojson_data: dict | None = None, water_geojson_data: dict | None = None,
     rainfall_soil_geojson_data: dict | None = None, land_cover_source: str | None = None,
 ) -> str:
@@ -238,7 +239,10 @@ def _webmap_fragment(
     terrain-topology basin analysis the rest of this map shows.
 
     `exposure_geojson_data` (population density, same per-cell heatmap
-    shape as elevation), `land_cover_geojson_data` (NLCD classes, see
+    shape as elevation), `poverty_geojson_data` (US Census-tract poverty
+    rate, see geoai_agent.real_data.fetch_poverty_rate_field -- a distinct
+    socioeconomic-vulnerability factor from exposure, not a duplicate of
+    it), `land_cover_geojson_data` (NLCD classes, see
     geoai_agent.land_cover.land_cover_geojson), `roads_geojson_data`/
     `water_geojson_data` (OSM roads/water, see geoai_agent.spatial_analysis.
     roads_geojson/water_geojson), and `rainfall_soil_geojson_data` (a single
@@ -278,6 +282,9 @@ def _webmap_fragment(
     exposure_js = (
         f"var exposureData = {json.dumps(exposure_geojson_data)};" if exposure_geojson_data else "var exposureData = null;"
     )
+    poverty_js = (
+        f"var povertyData = {json.dumps(poverty_geojson_data)};" if poverty_geojson_data else "var povertyData = null;"
+    )
     land_cover_js = (
         f"var landCoverData = {json.dumps(land_cover_geojson_data)};" if land_cover_geojson_data else "var landCoverData = null;"
     )
@@ -309,6 +316,7 @@ def _webmap_fragment(
       {buildings_js}
       {flow_field_js}
       {exposure_js}
+      {poverty_js}
       {land_cover_js}
       {roads_js}
       {water_js}
@@ -485,6 +493,17 @@ def _webmap_fragment(
         // per-cell heatmap shape as the elevation layer above.
         overlays['Population density (exposure)'] = L.geoJSON(exposureData, {{
           style: function(f) {{ return {{ fillColor: f.properties.color, color: f.properties.color, weight: 0, fillOpacity: 0.75 }}; }},
+        }});
+      }}
+
+      if (povertyData) {{
+        // US Census-tract poverty rate (geoai_agent.real_data.
+        // fetch_poverty_rate_field) -- a distinct socioeconomic-
+        // vulnerability factor from population density above, now one of
+        // the Flood Priority Score's six weighted factors.
+        overlays['Poverty rate'] = L.geoJSON(povertyData, {{
+          style: function(f) {{ return {{ fillColor: f.properties.color, color: f.properties.color, weight: 0, fillOpacity: 0.75 }}; }},
+          onEachFeature: function(f, layer) {{ layer.bindPopup('<b>Poverty rate</b><br>' + f.properties.value.toFixed(1) + '%'); }},
         }});
       }}
 
@@ -2042,6 +2061,7 @@ def render_flood_report_html(
     buildings_geojson: dict | None = None,
     flow_field_geojson: dict | None = None,
     exposure_geojson: dict | None = None,
+    poverty_geojson: dict | None = None,
     land_cover_geojson_data: dict | None = None,
     roads_geojson: dict | None = None,
     water_geojson: dict | None = None,
@@ -2050,6 +2070,7 @@ def render_flood_report_html(
     osm_infrastructure_data_available: bool = False,
     river_gauge_data_available: bool = False,
     exposure_source: str | None = None,
+    poverty_data_available: bool = False,
     land_cover_data_available: bool = False,
     land_cover_source: str | None = None,
     soil_data_available: bool = False,
@@ -2158,6 +2179,7 @@ def render_flood_report_html(
             fema_flood_geojson, pipes_geojson, gauges_geojson, buildings_geojson, boundary_mask,
             flow_field_geojson,
             exposure_geojson, land_cover_geojson_data, roads_geojson, water_geojson, rainfall_soil_geojson,
+            poverty_geojson_data=poverty_geojson,
             land_cover_source=land_cover_source,
         )
         if embed_interactive_map else ""
@@ -2348,6 +2370,7 @@ def render_flood_report_html(
             for label, key in (
                 ("topological", "topological_score"), ("contributing area", "contributing_area_score"),
                 ("rainfall", "rainfall_score"), ("slope", "slope_score"), ("exposure", "exposure_score"),
+                ("poverty", "poverty_score"),
             )
         )
 
@@ -2487,7 +2510,7 @@ def render_flood_report_html(
         "storm uniformly across the whole area, so rainfall_score is the exact same number for every basin "
         "here. Whatever weight it's given only shifts every basin's risk_score by the same constant amount, "
         "which cannot change WHICH basin ranks highest -- verified directly: re-ranking these same basins "
-        "with rainfall's raw weight set to 0%, 20%, and 55% (holding the other four weights' relative "
+        "with rainfall's raw weight set to 0%, 20%, and 55% (holding the other five weights' relative "
         "proportions fixed) produces an identical order every time. It only matters if risk_score is ever "
         "compared ACROSS different storm scenarios (see the expected-annual-runoff aggregation below)."
     )
@@ -2518,7 +2541,7 @@ def render_flood_report_html(
             "not an expert-named preset and not computed by the Entropy Weight Method. Like every other "
             "weighting mode here, this is NOT a statistically calibrated flood-risk model fit or validated "
             "against historical flood outcome data -- risk_score stays a transparent, reproducible way to "
-            f"combine five heuristic signals into one ordering. {_rainfall_invariance_note}"
+            f"combine six heuristic signals into one ordering. {_rainfall_invariance_note}"
         )
     else:
         weighting_method_note = (
@@ -2590,6 +2613,28 @@ def render_flood_report_html(
             "to distinguishing these basins from each other this run."
         )
 
+    if poverty_data_available:
+        poverty_label = "US Census tracts (live)"
+        poverty_score_formula_note = (
+            "US Census-tract poverty rate (percent of population below the federal poverty level, latest ACS "
+            "5-year estimate, via Esri Living Atlas' <code>ACS_Poverty_Status_View_Boundaries</code> layer -- "
+            "see geoai_agent.real_data.fetch_poverty_rate_field) <strong>at this basin's own pour point only</strong> "
+            "(a single grid cell, not a catchment average), min-max normalized against that field's range across "
+            "the whole analysis grid. Tract-level, not block-group-level like population density above -- ACS "
+            "doesn't publish this measure at block-group scale (poverty status's own margin-of-error requirements "
+            "get too wide at that fine a geography) -- so this reflects the broader neighborhood around a basin's "
+            "pour point, not that single block. A genuinely different dimension from Exposure above: this measures "
+            "how financially able the people who ARE there are to absorb, evacuate from, or recover from a flood, "
+            "not how many people/structures are there in the first place."
+        )
+    else:
+        poverty_label = "not available (neutral default)"
+        poverty_score_formula_note = (
+            "no poverty-rate data was available for this run (no US Census coverage or fetch failure), so every "
+            "basin was given the same neutral 0.5 -- poverty contributed nothing to distinguishing these basins "
+            "from each other this run."
+        )
+
     stat_chips = f"""
   <div class="stat"><span class="stat-label">Data source</span><span class="stat-value">{html.escape(elevation_source)}</span></div>
   <div class="stat"><span class="stat-label">Analysis grid</span><span class="stat-value">{elevation.shape[1]}&times;{elevation.shape[0]}</span></div>
@@ -2598,6 +2643,7 @@ def render_flood_report_html(
   <div class="stat"><span class="stat-label">Design storm</span><span class="stat-value">{scenario['label']} &middot; {scenario['intensity_mm_per_hr']:.0f} mm/hr, 1-hour intensity <span style="font-weight:400;color:var(--ink-muted);font-size:12.5px;">({rainfall_source_label})</span></span></div>
   <div class="stat"><span class="stat-label">Boundary source</span><span class="stat-value">{'OpenStreetMap (Nominatim)' if boundary_available else 'padded box around geocoded point'}</span></div>
   <div class="stat"><span class="stat-label">Exposure data</span><span class="stat-value">{exposure_label}</span></div>
+  <div class="stat"><span class="stat-label">Poverty data</span><span class="stat-value">{poverty_label}</span></div>
   <div class="stat"><span class="stat-label">FEMA flood data</span><span class="stat-value">{'NFHL (live)' if fema_available else 'not available for this area'}</span></div>
   <div class="stat"><span class="stat-label">River gauge data</span><span class="stat-value">{'USGS NWIS (live)' if river_gauge_data_available else 'no active gauges nearby'}</span></div>
   <div class="stat"><span class="stat-label">Runoff coefficient</span><span class="stat-value">{f"{_land_cover_source_label(land_cover_source)} + {'SSURGO soil' if hydrologic_group_source == 'measured' else 'assumed soil group'} (per basin)" if land_cover_data_available and soil_data_available else 'assumed constant'}</span></div>
@@ -2847,7 +2893,7 @@ def render_flood_report_html(
       <strong>This is a prioritization tool, not a validated flood-risk prediction.</strong> {weighting_method_note}
       Apply a different, equally legitimate weighting to the exact same underlying per-factor scores below and
       these same basins would rank differently. Treat the Flood Priority Score as a transparent, reproducible way
-      to combine five heuristic signals into one ordering for deciding what to look at first -- not as a
+      to combine six heuristic signals into one ordering for deciding what to look at first -- not as a
       probability, a percentage chance of flooding, or an objectively "correct" ranking of actual flood risk.
     </div>
     <details class="hotspot-detail">
@@ -2875,6 +2921,7 @@ def render_flood_report_html(
             normalized against the slope range across the whole analysis grid. Flatter ground scores higher
             (ponds more readily than a steep channel).</dd>
           <dt>Exposure</dt><dd>{exposure_score_formula_note}</dd>
+          <dt>Poverty</dt><dd>{poverty_score_formula_note}</dd>
         </dl>
       </div>
     </details>

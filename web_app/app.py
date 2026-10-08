@@ -81,7 +81,7 @@ from geoai_agent.land_cover import (
 )
 from geoai_agent.llm_client import LLMClient
 from geoai_agent.report import all_minima_geojson, elevation_hillshade_geojson, render_flood_report_html, terrain_legend_stops
-from geoai_agent.flow_field import flow_field_geojson
+from geoai_agent.flow_field import flow_field_geojson, flow_vector_grid
 from geoai_agent.morse_validation import compare_morse_to_d8
 from geoai_agent.soil_data import fetch_dominant_hydrologic_soil_group
 from geoai_agent.spatial_analysis import (
@@ -103,6 +103,7 @@ from geoai_agent.real_data import (
     build_real_world_dataset,
     fetch_global_population_density_field,
     fetch_population_exposure_field,
+    fetch_poverty_rate_field,
     geocode_place,
     ground_spacing_meters,
     is_in_continental_us,
@@ -1012,7 +1013,7 @@ def agent_analyze_stream():
     # Two ways the frontend can pick weights, via weighting_method:
     # - "custom" (the Modify-weights sliders, available once a run has
     #   completed): a hand-set {"topological", "contributing_area",
-    #   "rainfall", "slope", "exposure"} dict in custom_weights (JSON),
+    #   "rainfall", "slope", "exposure", "poverty"} dict in custom_weights (JSON),
     #   validated below and passed straight through to rank_flood_basins.
     # - anything else (including the field being omitted, which is every
     #   run now that the UI has no weighting-method choice left): flood_
@@ -1030,7 +1031,7 @@ def agent_analyze_stream():
             custom_weights = json.loads(custom_weights_raw) if custom_weights_raw else None
         except json.JSONDecodeError:
             return jsonify({"error": "custom_weights must be JSON"}), 400
-        required_weight_keys = {"topological", "contributing_area", "rainfall", "slope", "exposure"}
+        required_weight_keys = {"topological", "contributing_area", "rainfall", "slope", "exposure", "poverty"}
         if not isinstance(custom_weights, dict) or set(custom_weights) != required_weight_keys:
             return jsonify({
                 "error": f"custom_weights must be a JSON object with exactly the keys {sorted(required_weight_keys)}"
@@ -1398,6 +1399,24 @@ def agent_analyze_stream():
                 except Exception as exc:
                     return None, None, exc
 
+            def _fetch_poverty():
+                # US Census-tract poverty rate (geoai_agent.real_data.
+                # fetch_poverty_rate_field) -- a distinct socioeconomic-
+                # vulnerability factor from exposure_field above (that one
+                # measures HOW MANY people/structures are there; this one
+                # measures how financially able the people who are there are
+                # to absorb/evacuate/recover from a flood). US-only, and
+                # unlike exposure there is no live global-coverage fallback
+                # for this specific measure this project has found -- any
+                # failure (most commonly just outside-US) means that factor
+                # falls back to flood_tools' neutral 0.5 default, the same
+                # "no data means no data, not a crash" contract every other
+                # optional source here follows.
+                try:
+                    return fetch_poverty_rate_field(bounds, resolution), None
+                except Exception as exc:
+                    return None, exc
+
             def _fetch_pipes():
                 try:
                     return fetch_nearby_pipes(bounds)
@@ -1416,7 +1435,7 @@ def agent_analyze_stream():
                 except Exception:
                     return None
 
-            yield line({"type": "step", "label": "Retrieving data from 9 sources (5 concurrent workers)", "detail": {
+            yield line({"type": "step", "label": "Retrieving data from 10 sources (5 concurrent workers)", "detail": {
                 "target_resolution_meters": target_resolution_meters, "grid": list(resolution),
             }})
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
@@ -1426,6 +1445,7 @@ def agent_analyze_stream():
                 fut_elevation = pool.submit(_fetch_elevation)
                 fut_soil = pool.submit(_fetch_soil)
                 fut_exposure = pool.submit(_fetch_exposure)
+                fut_poverty = pool.submit(_fetch_poverty)
                 fut_pipes = pool.submit(_fetch_pipes)
                 fut_gauges = pool.submit(_fetch_gauges)
                 fut_infra = pool.submit(_fetch_infra)
@@ -1471,6 +1491,7 @@ def agent_analyze_stream():
                 hydrologic_group = fut_soil.result()
                 hydrologic_group_source = "measured" if hydrologic_group else None
                 exposure_source, exposure_field, exposure_exc = fut_exposure.result()
+                poverty_field, poverty_exc = fut_poverty.result()
                 nearby_pipes = fut_pipes.result()
                 river_gauges = fut_gauges.result()
                 osm_infra = fut_infra.result()
@@ -1549,6 +1570,11 @@ def agent_analyze_stream():
                 yield line({"type": "step", "label": "Exposure data failed to load -- ignoring that factor", "detail": {"error": str(exposure_exc)}})
             else:
                 yield line({"type": "step", "label": "No exposure/population data available -- that factor will use a neutral default", "detail": {"error": str(exposure_exc)}})
+
+            if poverty_field is not None:
+                yield line({"type": "step", "label": "Poverty-rate data loaded (US Census tracts)"})
+            else:
+                yield line({"type": "step", "label": "No poverty-rate data available for this area -- that factor will use a neutral default", "detail": {"error": str(poverty_exc)}})
 
             if nearby_pipes:
                 yield line({"type": "step", "label": "Stormwater pipe data found", "detail": {"num_pipes_in_area": len(nearby_pipes)}})
@@ -1748,8 +1774,8 @@ def agent_analyze_stream():
                 flood_result = rank_flood_basins(
                     elevation_field, morse_result, rainfall_scenario=_AGENT_RAINFALL_SCENARIO, rainfall_table=rainfall_table,
                     weights=weight_preset_used, runoff_coefficient=_AGENT_RUNOFF_COEFFICIENT,
-                    slope_field=slope_field, exposure_field=exposure_field, boundary_mask=boundary_mask,
-                    land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
+                    slope_field=slope_field, exposure_field=exposure_field, poverty_field=poverty_field,
+                    boundary_mask=boundary_mask, land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
                     land_cover_cn_table=land_cover_cn_table,
                 )
                 if boundary is not None:
@@ -1817,8 +1843,8 @@ def agent_analyze_stream():
                     weight_sensitivity = compute_weight_sensitivity(
                         elevation_field, morse_result, rainfall_scenario=_AGENT_RAINFALL_SCENARIO,
                         rainfall_table=rainfall_table, runoff_coefficient=_AGENT_RUNOFF_COEFFICIENT,
-                        slope_field=slope_field, exposure_field=exposure_field, boundary_mask=boundary_mask,
-                        land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
+                        slope_field=slope_field, exposure_field=exposure_field, poverty_field=poverty_field,
+                        boundary_mask=boundary_mask, land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
                         land_cover_cn_table=land_cover_cn_table,
                     )
                     yield line({
@@ -1864,8 +1890,8 @@ def agent_analyze_stream():
                     ead_result = compute_expected_annual_runoff(
                         elevation_field, morse_result, rainfall_table=rainfall_table, weights=weight_preset_used,
                         runoff_coefficient=_AGENT_RUNOFF_COEFFICIENT, slope_field=slope_field, exposure_field=exposure_field,
-                        boundary_mask=boundary_mask, land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
-                        land_cover_cn_table=land_cover_cn_table,
+                        poverty_field=poverty_field, boundary_mask=boundary_mask, land_cover_grid=land_cover_grid,
+                        hydrologic_group=hydrologic_group, land_cover_cn_table=land_cover_cn_table,
                     )
                     ead_by_catchment = {b["catchment_id"]: b["expected_annual_runoff_m3s"] for b in ead_result["basins"]}
                     for h in flood_result["hotspots"]:
@@ -2086,6 +2112,10 @@ def agent_analyze_stream():
             if exposure_geojson_data and boundary is not None:
                 exposure_geojson_data = clip_geojson_to_polygon(exposure_geojson_data, boundary["polygon"])
 
+            poverty_geojson_data = field_to_geojson(poverty_field) if poverty_field is not None else None
+            if poverty_geojson_data and boundary is not None:
+                poverty_geojson_data = clip_geojson_to_polygon(poverty_geojson_data, boundary["polygon"])
+
             land_cover_geojson_data = (
                 land_cover_geojson(elevation_field, land_cover_grid, class_info=land_cover_class_info)
                 if land_cover_grid is not None else None
@@ -2135,11 +2165,20 @@ def agent_analyze_stream():
             # visualization extra shouldn't take down the whole run.
             try:
                 flow_field_geojson_data = flow_field_geojson(elevation_field, boundary_mask=boundary_mask)
+                # The downloadable report (report.py) keeps the static-arrow
+                # rendering above (flow_field_geojson_data) -- self-contained
+                # HTML, no dependency on this page's own JS. The LIVE map
+                # instead uses a denser vector grid (see flow_vector_grid's
+                # own docstring) to drive an animated flowing-particle layer
+                # in static/main.js, closer to a live weather-map wind field
+                # than a handful of static arrows.
+                flow_vector_field_data = flow_vector_grid(elevation_field, boundary_mask=boundary_mask)
                 yield line({"type": "step", "label": "Flow-direction field computed", "detail": {
                     "num_arrows": len(flow_field_geojson_data["features"]),
                 }})
             except Exception as exc:
                 flow_field_geojson_data = None
+                flow_vector_field_data = None
                 yield line({"type": "step", "label": "Skipping flow-direction field", "detail": {"error": str(exc)}})
 
             yield line({"type": "step", "label": "Computing drainage demand for every local minimum"})
@@ -2152,8 +2191,8 @@ def agent_analyze_stream():
                 flood_result_all = rank_flood_basins(
                     elevation_field, morse_result_all, rainfall_scenario=_AGENT_RAINFALL_SCENARIO, rainfall_table=rainfall_table,
                     weights=weight_preset_used, runoff_coefficient=_AGENT_RUNOFF_COEFFICIENT,
-                    slope_field=slope_field, exposure_field=exposure_field, boundary_mask=boundary_mask,
-                    land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
+                    slope_field=slope_field, exposure_field=exposure_field, poverty_field=poverty_field,
+                    boundary_mask=boundary_mask, land_cover_grid=land_cover_grid, hydrologic_group=hydrologic_group,
                     land_cover_cn_table=land_cover_cn_table,
                 )
                 all_minima_hotspots = flood_result_all["hotspots"]
@@ -2575,6 +2614,8 @@ def agent_analyze_stream():
                 buildings_geojson=buildings_geojson_data,
                 flow_field_geojson=flow_field_geojson_data,
                 exposure_geojson=exposure_geojson_data,
+                poverty_geojson=poverty_geojson_data,
+                poverty_data_available=poverty_field is not None,
                 land_cover_geojson_data=land_cover_geojson_data,
                 roads_geojson=roads_geojson_data,
                 water_geojson=water_geojson_data,
@@ -2617,8 +2658,9 @@ def agent_analyze_stream():
                 "pipes_geojson": pipes_geojson_data,
                 "gauges_geojson": gauges_geojson_data,
                 "buildings_geojson": buildings_geojson_data,
-                "flow_field_geojson": flow_field_geojson_data,
+                "flow_vector_field": flow_vector_field_data,
                 "exposure_geojson": exposure_geojson_data,
+                "poverty_geojson": poverty_geojson_data,
                 "land_cover_geojson": land_cover_geojson_data,
                 "roads_geojson": roads_geojson_data,
                 "water_geojson": water_geojson_data,
